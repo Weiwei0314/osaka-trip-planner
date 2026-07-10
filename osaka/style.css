@@ -531,6 +531,7 @@ body {
 
 .event-add-btns {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 6px 16px 12px 48px;
   background: var(--card);

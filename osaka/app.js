@@ -6,8 +6,16 @@ function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
 
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function toDateStr(d) {
+  return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+}
+
 function todayStr() {
-  return new Date().toISOString().split('T')[0];
+  return toDateStr(new Date());
 }
 
 function formatDate(dateStr) {
@@ -29,7 +37,7 @@ function getDays(startDate, endDate) {
   const cur  = new Date(startDate + 'T00:00:00');
   const end  = new Date(endDate + 'T00:00:00');
   while (cur <= end) {
-    days.push(cur.toISOString().split('T')[0]);
+    days.push(toDateStr(cur));
     cur.setDate(cur.getDate() + 1);
   }
   return days;
@@ -287,9 +295,16 @@ function renderTimeline() {
     return;
   }
 
-  const days   = getDays(trip.startDate, trip.endDate);
-  const events = DB.events(S.tripId);
-  const WD     = ['日','一','二','三','四','五','六'];
+  const days     = getDays(trip.startDate, trip.endDate);
+  const events   = DB.events(S.tripId);
+  const shopping = DB.shopping(S.tripId);
+  const todos    = DB.todos(S.tripId);
+  const WD       = ['日','一','二','三','四','五','六'];
+
+  // Items added directly in Shopping/Todo tabs (no eventId) with no valid day-of-trip date
+  const noDateShop = shopping.filter(s => !s.eventId && !(s.date && days.includes(s.date)));
+  const noDateTodo = todos.filter(t => !t.eventId && !(t.assignedDate && days.includes(t.assignedDate)));
+  const noDateHtml = standaloneListsHtml(noDateShop, noDateTodo);
 
   const html = days.map((day, i) => {
     const d        = new Date(day + 'T00:00:00');
@@ -297,6 +312,11 @@ function renderTimeline() {
     const dayEvs   = events
       .filter(e => e.date === day)
       .sort((a,b) => (a.startTime||'').localeCompare(b.startTime||''));
+
+    // Items added directly in Shopping/Todo tabs for this day (no eventId)
+    const dayShop        = shopping.filter(s => !s.eventId && s.date === day);
+    const dayTodo        = todos.filter(t => !t.eventId && t.assignedDate === day);
+    const standaloneHtml = standaloneListsHtml(dayShop, dayTodo);
 
     return `
       <div class="day-section">
@@ -306,11 +326,30 @@ function renderTimeline() {
         </div>
         ${dayEvs.length
           ? dayEvs.map(eventItem).join('')
-          : `<div class="day-empty">尚無行程，點「新增」加入</div>`}
+          : (standaloneHtml ? '' : `<div class="day-empty">尚無行程，點「新增」加入</div>`)}
+        ${standaloneHtml}
       </div>`;
   }).join('');
 
-  el.innerHTML = `<div class="timeline-content">${html}</div>`;
+  const noDateSection = noDateHtml ? `
+    <div class="day-section">
+      <div class="day-header"><span class="day-label">整個行程</span></div>
+      ${noDateHtml}
+    </div>` : '';
+
+  el.innerHTML = `<div class="timeline-content">${noDateSection}${html}</div>`;
+}
+
+function standaloneListsHtml(shopItems, todoItems) {
+  if (!shopItems.length && !todoItems.length) return '';
+  return `
+    ${shopItems.length ? `
+      <div class="event-sub-header">🛒 購物（未排入行程項目）</div>
+      <div class="item-list">${shopItems.map(shopItem).join('')}</div>` : ''}
+    ${todoItems.length ? `
+      <div class="event-sub-header">✅ 代辦（未排入行程項目）</div>
+      <div class="item-list">${todoItems.sort(sortTodos).map(todoItem).join('')}</div>` : ''}
+  `;
 }
 
 function eventItem(ev) {
@@ -361,6 +400,7 @@ function eventItem(ev) {
         data-event-id="${esc(ev.id)}" data-date="${esc(ev.date || '')}">＋ 購物</button>
       <button class="btn-add-sub" data-action="add-event-todo"
         data-event-id="${esc(ev.id)}" data-date="${esc(ev.date || '')}">＋ 代辦</button>
+      <button class="btn-add-sub" data-action="move-event" data-id="${esc(ev.id)}">📅 移動</button>
     </div>`;
 }
 
@@ -465,6 +505,11 @@ const PRIO = {
 };
 const PRIO_ORDER = { high: 0, medium: 1, low: 2 };
 
+function sortTodos(a, b) {
+  if (a.completed !== b.completed) return a.completed ? 1 : -1;
+  return (PRIO_ORDER[a.priority] ?? 1) - (PRIO_ORDER[b.priority] ?? 1);
+}
+
 function renderTodo() {
   const todos     = DB.todos(S.tripId);
   const trip      = DB.trip(S.tripId);
@@ -473,11 +518,6 @@ function renderTodo() {
   const evMap     = Object.fromEntries(allEvs.map(e => [e.id, e]));
   const done      = todos.filter(t => t.completed).length;
   const WD        = ['日','一','二','三','四','五','六'];
-
-  const sortFn = (a, b) => {
-    if (a.completed !== b.completed) return a.completed ? 1 : -1;
-    return (PRIO_ORDER[a.priority] ?? 1) - (PRIO_ORDER[b.priority] ?? 1);
-  };
 
   let html = `
     <div class="list-header">
@@ -518,10 +558,10 @@ function renderTodo() {
       if (!evTodos.length) return;
       const ti = ev.startTime ? `${ev.startTime} ` : '';
       html += `<div class="event-sub-header">${esc(ti + ev.title)}</div>
-               <div class="item-list">${evTodos.sort(sortFn).map(todoItem).join('')}</div>`;
+               <div class="item-list">${evTodos.sort(sortTodos).map(todoItem).join('')}</div>`;
       evTodos.forEach(t => shown.add(t.id));
     });
-    const orphans = dayTodos.filter(t => !shown.has(t.id)).sort(sortFn);
+    const orphans = dayTodos.filter(t => !shown.has(t.id)).sort(sortTodos);
     if (orphans.length) {
       html += `<div class="event-sub-header">其他</div>
                <div class="item-list">${orphans.map(todoItem).join('')}</div>`;
@@ -530,7 +570,7 @@ function renderTodo() {
 
   if (noDate.length) {
     html += `<div class="day-group-header">整個行程</div>
-             <div class="item-list">${noDate.sort(sortFn).map(todoItem).join('')}</div>`;
+             <div class="item-list">${noDate.sort(sortTodos).map(todoItem).join('')}</div>`;
   }
 
   $('screen-detail').innerHTML = html;
@@ -623,6 +663,7 @@ function openModal(type, data) {
     case 'shopping': fillShoppingForm(data); $('modal-shopping').style.display = ''; break;
     case 'todo':     fillTodoForm(data);     $('modal-todo').style.display     = ''; break;
     case 'location': fillLocationForm(data); $('modal-location').style.display = ''; break;
+    case 'move-event': fillMoveEventForm(data); $('modal-move').style.display  = ''; break;
   }
 }
 
@@ -666,6 +707,10 @@ function fillTodoForm(todo) {
   $('todo-assigned-date').innerHTML = buildDayOptions(S.tripId, todo?.assignedDate || S.pendingDate || '');
 }
 
+function fillMoveEventForm(ev) {
+  $('move-event-date').innerHTML = buildDayOptions(S.tripId, ev?.date || '');
+}
+
 function fillLocationForm(loc) {
   $('modal-location-title').textContent = loc ? '編輯地點' : '新增地點';
   $('location-name').value     = loc?.name     || '';
@@ -693,6 +738,7 @@ function saveModal() {
     case 'shopping': saveShoppingForm(); break;
     case 'todo':     saveTodoForm();     break;
     case 'location': saveLocationForm(); break;
+    case 'move-event': saveMoveEventForm(); break;
   }
 }
 
@@ -726,17 +772,7 @@ function saveEventForm() {
     alert('結束時間必須晚於開始時間'); return;
   }
 
-  if (date && startTime && endTime) {
-    const conflicts = DB.events(S.tripId).filter(ev => {
-      if (ev.id === S.editId || ev.date !== date) return false;
-      if (!ev.startTime || !ev.endTime) return false;
-      return startTime < ev.endTime && ev.startTime < endTime;
-    });
-    if (conflicts.length > 0) {
-      const names = conflicts.map(e => `「${e.title}」`).join('、');
-      if (!confirm(`此行程時間與 ${names} 重疊，確定要繼續儲存嗎？`)) return;
-    }
-  }
+  if (!confirmNoTimeConflict(S.editId, date, startTime, endTime)) return;
 
   DB.saveEvent({
     id:        S.editId || genId(),
@@ -749,6 +785,32 @@ function saveEventForm() {
     category:  $('event-category').value,
     notes:     $('event-notes').value.trim(),
   });
+  closeModal();
+  renderDetail();
+}
+
+function confirmNoTimeConflict(excludeId, date, startTime, endTime) {
+  if (!date || !startTime || !endTime) return true;
+  const conflicts = DB.events(S.tripId).filter(ev => {
+    if (ev.id === excludeId || ev.date !== date) return false;
+    if (!ev.startTime || !ev.endTime) return false;
+    return startTime < ev.endTime && ev.startTime < endTime;
+  });
+  if (!conflicts.length) return true;
+  const names = conflicts.map(e => `「${e.title}」`).join('、');
+  return confirm(`此行程時間與 ${names} 重疊，確定要繼續嗎？`);
+}
+
+function saveMoveEventForm() {
+  const ev = DB.event(S.editId);
+  if (!ev) { closeModal(); return; }
+
+  const newDate = $('move-event-date').value;
+  if (newDate === ev.date) { closeModal(); return; }
+
+  if (!confirmNoTimeConflict(ev.id, newDate, ev.startTime, ev.endTime)) return;
+
+  DB.saveEvent({ ...ev, date: newDate });
   closeModal();
   renderDetail();
 }
@@ -854,6 +916,9 @@ document.addEventListener('click', e => {
 
     case 'edit-event':
       openModal('event', DB.event(id)); break;
+
+    case 'move-event':
+      openModal('move-event', DB.event(id)); break;
 
     case 'delete-event':
       showConfirm('確定要刪除這個行程項目？', () => {
