@@ -288,6 +288,37 @@ body {
 .event-item:first-of-type { border-top: 1px solid var(--gray2); }
 .event-item:active { background: var(--gray1); }
 
+.event-drag-handle {
+  align-self: center;
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--gray3);
+  font-size: 18px;
+  line-height: 1;
+  padding: 8px 2px;
+  margin: -8px -2px -8px -6px;
+  cursor: grab;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.event-drag-handle:active { cursor: grabbing; color: var(--blue); }
+
+.drag-ghost {
+  position: fixed;
+  z-index: 999;
+  pointer-events: none;
+  opacity: .92;
+  box-shadow: 0 8px 24px rgba(0,0,0,.25);
+  border-radius: 10px;
+}
+
+.drag-source-hidden { opacity: .25; }
+
+.day-section.drag-hover { background: #E3F0FF; border-radius: 10px; }
+.event-item.drag-hover  { outline: 2px solid var(--blue); outline-offset: -2px; }
+
 .event-icon {
   font-size: 22px;
   flex-shrink: 0;
@@ -714,6 +745,88 @@ textarea {
   min-height: 80px;
   resize: none;
   line-height: 1.5;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+}
+
+/* ── Wheel time picker ── */
+.wheel-picker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 180px;
+  background: var(--gray1);
+  border-radius: 10px;
+  padding: 0 8px;
+}
+
+.wheel-col {
+  flex: 1;
+  max-width: 80px;
+  height: 100%;
+  overflow-y: scroll;
+  scroll-snap-type: y mandatory;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  cursor: grab;
+  touch-action: pan-y;
+}
+
+.wheel-col:active { cursor: grabbing; }
+.wheel-col::-webkit-scrollbar { display: none; }
+
+.wheel-pad { height: 72px; }
+
+.wheel-item {
+  height: 36px;
+  line-height: 36px;
+  text-align: center;
+  font-size: 17px;
+  color: var(--gray4);
+  scroll-snap-align: center;
+  -webkit-tap-highlight-color: transparent;
+  cursor: pointer;
+}
+
+.wheel-item.selected { color: var(--blue); font-weight: 600; }
+
+.wheel-unit {
+  font-size: 13px;
+  color: var(--gray4);
+  flex-shrink: 0;
+}
+
+.wheel-highlight {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 72px;
+  height: 36px;
+  border-top: 1px solid var(--gray3);
+  border-bottom: 1px solid var(--gray3);
+  pointer-events: none;
+}
+
+.duration-end-preview {
+  font-size: 13px;
+  color: var(--blue);
+  text-align: center;
+  margin-top: 8px;
+  font-weight: 500;
 }
 
 /* ── Confirm modal ── */

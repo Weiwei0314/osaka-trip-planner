@@ -114,16 +114,36 @@
             </select>
           </div>
         </div>
-        <div class="form-row">
+        <div class="form-group">
+          <label class="checkbox-label">
+            <input type="checkbox" id="event-has-time">
+            設定時間
+          </label>
+        </div>
+        <div id="event-time-fields" style="display:none">
           <div class="form-group">
             <label>開始時間</label>
-            <select id="event-start-time"></select>
+            <div class="wheel-picker">
+              <div class="wheel-col" id="wheel-start-ampm"></div>
+              <div class="wheel-col" id="wheel-start-hour"></div>
+              <div class="wheel-col" id="wheel-start-min"></div>
+              <div class="wheel-highlight"></div>
+            </div>
           </div>
           <div class="form-group">
-            <label>結束時間</label>
-            <select id="event-end-time"></select>
+            <label>停留時間</label>
+            <div class="wheel-picker wheel-picker-duration">
+              <div class="wheel-col" id="wheel-dur-hour"></div>
+              <span class="wheel-unit">時</span>
+              <div class="wheel-col" id="wheel-dur-min"></div>
+              <span class="wheel-unit">分</span>
+              <div class="wheel-highlight"></div>
+            </div>
+            <div class="duration-end-preview" id="duration-end-preview"></div>
           </div>
         </div>
+        <input type="hidden" id="event-start-time">
+        <input type="hidden" id="event-end-time">
         <div class="form-group">
           <label>地點</label>
           <input type="text" id="event-location-input" placeholder="地點名稱或地址">

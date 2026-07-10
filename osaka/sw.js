@@ -1,4 +1,4 @@
-const CACHE = 'trip-planner-v4';
+const CACHE = 'trip-planner-v7';
 const ASSETS = ['home.html', 'app.js', 'style.css', 'manifest.json', 'icon.svg'];
 
 self.addEventListener('install', e => {
@@ -17,6 +17,12 @@ self.addEventListener('activate', e => {
 
 self.addEventListener('fetch', e => {
   e.respondWith(
-    caches.match(e.request).then(cached => cached || fetch(e.request).catch(() => cached))
+    fetch(e.request)
+      .then(res => {
+        const resClone = res.clone();
+        caches.open(CACHE).then(c => c.put(e.request, resClone));
+        return res;
+      })
+      .catch(() => caches.match(e.request))
   );
 });

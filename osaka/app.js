@@ -60,15 +60,23 @@ function countdown(startDate) {
   return `還有 ${diff} 天`;
 }
 
-function buildTimeOptions(selected) {
-  let html = '<option value="">-- 時間 --</option>';
-  for (let h = 0; h < 24; h++) {
-    for (const m of [0, 30]) {
-      const t = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
-      html += `<option value="${t}"${t === selected ? ' selected' : ''}>${t}</option>`;
-    }
-  }
-  return html;
+function toMinutes(hhmm) {
+  const [h, m] = hhmm.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function to12h(hhmm) {
+  if (!hhmm) return { ampm: 'AM', hour: '9', min: '00' };
+  const [h, m] = hhmm.split(':').map(Number);
+  const ampm = h < 12 ? 'AM' : 'PM';
+  let hour12 = h % 12; if (hour12 === 0) hour12 = 12;
+  return { ampm, hour: String(hour12), min: String(m).padStart(2, '0') };
+}
+
+function from12h(ampm, hour12, min) {
+  let h = Number(hour12) % 12;
+  if (ampm === 'PM') h += 12;
+  return `${String(h).padStart(2, '0')}:${min}`;
 }
 
 function buildDayOptions(tripId, selected) {
@@ -319,7 +327,7 @@ function renderTimeline() {
     const standaloneHtml = standaloneListsHtml(dayShop, dayTodo);
 
     return `
-      <div class="day-section">
+      <div class="day-section" data-date="${esc(day)}">
         <div class="day-header">
           <span class="day-label">${esc(label)}</span>
           <button class="btn-add-inline" data-action="add-event" data-date="${esc(day)}">＋ 新增</button>
@@ -385,6 +393,7 @@ function eventItem(ev) {
 
   return `
     <div class="event-item" data-action="edit-event" data-id="${esc(ev.id)}">
+      <button class="event-drag-handle" data-action="drag-noop" data-id="${esc(ev.id)}" title="拖曳移動">⠿</button>
       <div class="event-icon">${icon}</div>
       <div class="event-body">
         <div class="event-title">${esc(ev.title)}</div>
@@ -680,12 +689,120 @@ function fillEventForm(ev) {
   $('modal-event-title').textContent    = ev?.id ? '編輯行程項目' : '新增行程項目';
   $('event-title-input').value          = ev?.title     || '';
   $('event-date').value                   = ev?.date     || S.pendingDate || '';
-  $('event-start-time').innerHTML        = buildTimeOptions(ev?.startTime || '');
-  $('event-end-time').innerHTML          = buildTimeOptions(ev?.endTime   || '');
   $('event-location-input').value       = ev?.location  || '';
   $('event-category').value             = ev?.category  || 'attraction';
   $('event-notes').value                = ev?.notes     || '';
+  setupTimeWheels(ev?.startTime || '', ev?.endTime || '');
   S.pendingDate = null;
+}
+
+// ─── Time Wheel Picker ────────────────────────────────────────────────────────
+
+const WHEEL_ITEM_H  = 36;
+const AMPM_ITEMS     = [{ value: 'AM', label: '上午' }, { value: 'PM', label: '下午' }];
+const HOUR12_ITEMS   = Array.from({ length: 12 }, (_, i) => ({ value: String(i + 1), label: String(i + 1) }));
+const MIN_ITEMS      = [{ value: '00', label: '00' }, { value: '30', label: '30' }];
+const DUR_HOUR_ITEMS = Array.from({ length: 13 }, (_, i) => ({ value: String(i), label: String(i) }));
+
+const wheelState = { start: { ampm: 'AM', hour: '9', min: '00' }, dur: { hour: '1', min: '00' } };
+
+function freshEl(id) {
+  const old = $(id);
+  const clone = old.cloneNode(false);
+  old.replaceWith(clone);
+  return clone;
+}
+
+function markWheelSelected(el, idx) {
+  el.querySelectorAll('.wheel-item').forEach((it, i) => it.classList.toggle('selected', i === idx));
+}
+
+function buildWheelCol(id, items, selectedValue, onSettle) {
+  const el = freshEl(id);
+  el.innerHTML = '<div class="wheel-pad"></div>' +
+    items.map(it => `<div class="wheel-item" data-value="${esc(it.value)}">${esc(it.label)}</div>`).join('') +
+    '<div class="wheel-pad"></div>';
+
+  const idx = Math.max(0, items.findIndex(it => it.value === selectedValue));
+  el.scrollTop = idx * WHEEL_ITEM_H;
+  markWheelSelected(el, idx);
+
+  let settleTimer = null;
+  el.addEventListener('scroll', () => {
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(() => {
+      const i = Math.min(items.length - 1, Math.max(0, Math.round(el.scrollTop / WHEEL_ITEM_H)));
+      markWheelSelected(el, i);
+      onSettle(items[i].value);
+    }, 130);
+  });
+
+  // Mouse drag-to-scroll (touch already scrolls natively; only handle mouse/pen)
+  let dragging = false, dragMoved = false, startY = 0, startScroll = 0;
+  el.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'touch') return;
+    dragging = true; dragMoved = false;
+    startY = e.clientY; startScroll = el.scrollTop;
+    el.setPointerCapture(e.pointerId);
+  });
+  el.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const dy = e.clientY - startY;
+    if (Math.abs(dy) > 3) dragMoved = true;
+    el.scrollTop = startScroll - dy;
+  });
+  el.addEventListener('pointerup',     () => { dragging = false; });
+  el.addEventListener('pointercancel', () => { dragging = false; });
+
+  el.addEventListener('click', e => {
+    if (dragMoved) { dragMoved = false; return; }
+    const item = e.target.closest('.wheel-item');
+    if (!item) return;
+    const i = [...el.children].indexOf(item) - 1;
+    el.scrollTo({ top: i * WHEEL_ITEM_H, behavior: 'smooth' });
+  });
+}
+
+function setupTimeWheels(startTime, endTime) {
+  const has = !!startTime;
+  $('event-has-time').checked = has;
+  $('event-time-fields').style.display = has ? '' : 'none';
+
+  const st = to12h(startTime || '09:00');
+  wheelState.start = { ...st };
+  buildWheelCol('wheel-start-ampm', AMPM_ITEMS,   st.ampm, v => { wheelState.start.ampm = v; updateComputedEndTime(); });
+  buildWheelCol('wheel-start-hour', HOUR12_ITEMS, st.hour, v => { wheelState.start.hour = v; updateComputedEndTime(); });
+  buildWheelCol('wheel-start-min',  MIN_ITEMS,    st.min,  v => { wheelState.start.min  = v; updateComputedEndTime(); });
+
+  let durTotal = 60;
+  if (startTime && endTime) {
+    durTotal = (toMinutes(endTime) - toMinutes(startTime) + 24 * 60) % (24 * 60);
+  }
+  wheelState.dur = {
+    hour: String(Math.min(Math.floor(durTotal / 60), 12)),
+    min:  (durTotal % 60) >= 30 ? '30' : '00',
+  };
+  buildWheelCol('wheel-dur-hour', DUR_HOUR_ITEMS, wheelState.dur.hour, v => { wheelState.dur.hour = v; updateComputedEndTime(); });
+  buildWheelCol('wheel-dur-min',  MIN_ITEMS,      wheelState.dur.min,  v => { wheelState.dur.min  = v; updateComputedEndTime(); });
+
+  updateComputedEndTime();
+}
+
+function updateComputedEndTime() {
+  if (!$('event-has-time').checked) { $('event-start-time').value = ''; $('event-end-time').value = ''; return; }
+
+  const start24 = from12h(wheelState.start.ampm, wheelState.start.hour, wheelState.start.min);
+  const durMin  = Number(wheelState.dur.hour) * 60 + Number(wheelState.dur.min);
+  let endMin     = toMinutes(start24) + durMin;
+  let clamped    = false;
+  if (endMin >= 24 * 60) { endMin = 23 * 60 + 30; clamped = true; }
+  const end24 = `${String(Math.floor(endMin / 60)).padStart(2, '0')}:${String(endMin % 60).padStart(2, '0')}`;
+
+  $('event-start-time').value = start24;
+  $('event-end-time').value   = end24;
+  $('duration-end-preview').textContent = clamped
+    ? `結束於 ${end24}（已達當日最晚時間）`
+    : `結束於 ${end24}`;
 }
 
 function fillShoppingForm(item) {
@@ -789,10 +906,11 @@ function saveEventForm() {
   renderDetail();
 }
 
-function confirmNoTimeConflict(excludeId, date, startTime, endTime) {
+function confirmNoTimeConflict(excludeId, date, startTime, endTime, extraExcludeIds = []) {
   if (!date || !startTime || !endTime) return true;
+  const excludeSet = new Set([excludeId, ...extraExcludeIds]);
   const conflicts = DB.events(S.tripId).filter(ev => {
-    if (ev.id === excludeId || ev.date !== date) return false;
+    if (excludeSet.has(ev.id) || ev.date !== date) return false;
     if (!ev.startTime || !ev.endTime) return false;
     return startTime < ev.endTime && ev.startTime < endTime;
   });
@@ -986,10 +1104,121 @@ document.addEventListener('click', e => {
   }
 });
 
+// ─── Event Card Drag & Drop ───────────────────────────────────────────────────
+
+let dragCtx = null;
+
+document.addEventListener('pointerdown', e => {
+  const handle = e.target.closest('[data-action="drag-noop"]');
+  if (!handle) return;
+
+  const ev = DB.event(handle.dataset.id);
+  if (!ev) return;
+
+  const card = handle.closest('.event-item');
+  const rect = card.getBoundingClientRect();
+
+  const ghost = card.cloneNode(true);
+  ghost.classList.add('drag-ghost');
+  ghost.style.width = rect.width + 'px';
+  ghost.style.left  = rect.left + 'px';
+  ghost.style.top   = rect.top + 'px';
+  document.body.appendChild(ghost);
+
+  card.classList.add('drag-source-hidden');
+
+  dragCtx = {
+    ev, card, ghost,
+    pointerId: e.pointerId,
+    startX: e.clientX, startY: e.clientY,
+    lastTarget: null,
+  };
+
+  handle.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+
+document.addEventListener('pointermove', e => {
+  if (!dragCtx || e.pointerId !== dragCtx.pointerId) return;
+
+  const dx = e.clientX - dragCtx.startX;
+  const dy = e.clientY - dragCtx.startY;
+  dragCtx.ghost.style.transform = `translate(${dx}px, ${dy}px)`;
+
+  document.querySelectorAll('.drag-hover').forEach(el => el.classList.remove('drag-hover'));
+
+  dragCtx.ghost.style.display = 'none';
+  const under = document.elementFromPoint(e.clientX, e.clientY);
+  dragCtx.ghost.style.display = '';
+
+  const targetCard    = under?.closest('.event-item');
+  const targetSection = under?.closest('.day-section[data-date]');
+
+  if (targetCard && targetCard !== dragCtx.card) {
+    targetCard.classList.add('drag-hover');
+    dragCtx.lastTarget = { type: 'card', id: targetCard.dataset.id };
+  } else if (targetSection) {
+    targetSection.classList.add('drag-hover');
+    dragCtx.lastTarget = { type: 'section', date: targetSection.dataset.date };
+  } else {
+    dragCtx.lastTarget = null;
+  }
+});
+
+function endDrag(commit) {
+  if (!dragCtx) return;
+  document.querySelectorAll('.drag-hover').forEach(el => el.classList.remove('drag-hover'));
+
+  if (commit) {
+    const { ev, lastTarget } = dragCtx;
+
+    if (lastTarget?.type === 'card' && lastTarget.id !== ev.id) {
+      const target = DB.event(lastTarget.id);
+      if (target) {
+        if (target.date === ev.date) {
+          const swapped = { start: target.startTime, end: target.endTime };
+          const okA = confirmNoTimeConflict(ev.id, ev.date, swapped.start, swapped.end, [target.id]);
+          const okB = okA && confirmNoTimeConflict(target.id, target.date, ev.startTime, ev.endTime, [ev.id]);
+          if (okA && okB) {
+            DB.saveEvent({ ...ev,     startTime: swapped.start, endTime: swapped.end });
+            DB.saveEvent({ ...target, startTime: ev.startTime,  endTime: ev.endTime  });
+          }
+        } else if (confirmNoTimeConflict(ev.id, target.date, ev.startTime, ev.endTime)) {
+          DB.saveEvent({ ...ev, date: target.date });
+        }
+      }
+    } else if (lastTarget?.type === 'section' && lastTarget.date !== ev.date) {
+      if (confirmNoTimeConflict(ev.id, lastTarget.date, ev.startTime, ev.endTime)) {
+        DB.saveEvent({ ...ev, date: lastTarget.date });
+      }
+    }
+  }
+
+  dragCtx.ghost.remove();
+  dragCtx.card.classList.remove('drag-source-hidden');
+  dragCtx = null;
+  renderDetail();
+}
+
+document.addEventListener('pointerup', e => {
+  if (!dragCtx || e.pointerId !== dragCtx.pointerId) return;
+  endDrag(true);
+});
+
+document.addEventListener('pointercancel', e => {
+  if (!dragCtx || e.pointerId !== dragCtx.pointerId) return;
+  endDrag(false);
+});
+
 // ─── Static Event Listeners ───────────────────────────────────────────────────
 
 $('btn-back').addEventListener('click', backToTrips);
 $('btn-add').addEventListener('click', headerAdd);
+
+$('event-has-time').addEventListener('change', e => {
+  $('event-time-fields').style.display = e.target.checked ? '' : 'none';
+  updateComputedEndTime();
+});
 
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => setTab(btn.dataset.tab));
