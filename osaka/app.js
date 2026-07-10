@@ -314,6 +314,10 @@ function renderTimeline() {
   const noDateTodo = todos.filter(t => !t.eventId && !(t.assignedDate && days.includes(t.assignedDate)));
   const noDateHtml = standaloneListsHtml(noDateShop, noDateTodo);
 
+  // Group by eventId once instead of re-filtering the full lists inside eventItem() per event
+  const shopByEvent = groupByEventId(shopping);
+  const todoByEvent = groupByEventId(todos);
+
   const html = days.map((day, i) => {
     const d        = new Date(day + 'T00:00:00');
     const label    = `第 ${i+1} 天 · ${d.getMonth()+1}/${d.getDate()} (週${WD[d.getDay()]})`;
@@ -333,7 +337,7 @@ function renderTimeline() {
           <button class="btn-add-inline" data-action="add-event" data-date="${esc(day)}">＋ 新增</button>
         </div>
         ${dayEvs.length
-          ? dayEvs.map(eventItem).join('')
+          ? dayEvs.map(ev => eventItem(ev, shopByEvent, todoByEvent)).join('')
           : (standaloneHtml ? '' : `<div class="day-empty">尚無行程，點「新增」加入</div>`)}
         ${standaloneHtml}
       </div>`;
@@ -360,14 +364,24 @@ function standaloneListsHtml(shopItems, todoItems) {
   `;
 }
 
-function eventItem(ev) {
+function groupByEventId(items) {
+  const map = new Map();
+  items.forEach(item => {
+    if (!item.eventId) return;
+    if (!map.has(item.eventId)) map.set(item.eventId, []);
+    map.get(item.eventId).push(item);
+  });
+  return map;
+}
+
+function eventItem(ev, shopByEvent, todoByEvent) {
   const icon    = CAT_ICON[ev.category] || '📌';
   const timeStr = ev.startTime
     ? (ev.endTime ? `${ev.startTime}–${ev.endTime}` : ev.startTime)
     : '';
 
-  const shopItems = DB.shopping(S.tripId).filter(s => s.eventId === ev.id);
-  const todoItems = DB.todos(S.tripId).filter(t => t.eventId === ev.id);
+  const shopItems = shopByEvent.get(ev.id) || [];
+  const todoItems = todoByEvent.get(ev.id) || [];
 
   const shopHtml = shopItems.length ? `
     <div class="inline-list-header">🛒 購物 (${shopItems.length})</div>
@@ -1120,8 +1134,9 @@ document.addEventListener('pointerdown', e => {
 
   const ghost = card.cloneNode(true);
   ghost.classList.add('drag-ghost');
-  ghost.style.width = rect.width + 'px';
-  ghost.style.left  = rect.left + 'px';
+  const ghostWidth = Math.min(rect.width, window.innerWidth - 16);
+  ghost.style.width = ghostWidth + 'px';
+  ghost.style.left  = Math.min(rect.left, window.innerWidth - ghostWidth - 8) + 'px';
   ghost.style.top   = rect.top + 'px';
   document.body.appendChild(ghost);
 

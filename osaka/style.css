@@ -13,11 +13,16 @@
   --card:    #FFFFFF;
   --text:    #1C1C1E;
   --text2:   #3C3C43;
-  --header-h: 52px;
-  --tabbar-h: 56px;
+  --header-h: 56px;
+  --tabbar-h: 66px;
 }
 
 html { -webkit-text-size-adjust: 100%; }
+
+html, body {
+  overflow-x: hidden;
+  width: 100%;
+}
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
@@ -25,6 +30,7 @@ body {
   color: var(--text);
   font-size: 16px;
   overscroll-behavior: none;
+  touch-action: manipulation;
 }
 
 /* ── App Shell ── */
@@ -42,7 +48,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: var(--header-h);
+  height: calc(var(--header-h) + env(safe-area-inset-top));
   background: rgba(242,242,247,0.92);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -75,9 +81,10 @@ body {
   color: var(--blue);
   font-size: 16px;
   font-weight: 400;
-  padding: 8px;
+  padding: 10px;
   cursor: pointer;
-  min-width: 60px;
+  min-width: 48px;
+  min-height: 44px;
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -97,7 +104,7 @@ body {
 /* ── Tab Bar ── */
 #tab-bar {
   display: flex;
-  height: var(--tabbar-h);
+  height: calc(var(--tabbar-h) + env(safe-area-inset-bottom));
   background: rgba(242,242,247,0.95);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -108,15 +115,16 @@ body {
 
 .tab-btn {
   flex: 1;
+  height: 100%;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 2px;
+  gap: 4px;
   background: none;
   border: none;
   color: var(--gray4);
-  font-size: 10px;
+  font-size: 11px;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
   transition: color .15s;
@@ -195,6 +203,7 @@ body {
 .status-past     { background: var(--gray2); color: var(--gray4); }
 
 .btn-icon-sm {
+  position: relative;
   width: 28px;
   height: 28px;
   border: none;
@@ -207,6 +216,24 @@ body {
   align-items: center;
   justify-content: center;
   -webkit-tap-highlight-color: transparent;
+}
+
+/* Expand the tappable area of small icon buttons past their visual size
+   (keeps compact look while meeting a ~44px minimum touch target) */
+.btn-icon-sm::after,
+.btn-del::after,
+.check-btn::after,
+.event-drag-handle::after {
+  content: '';
+  position: absolute;
+  inset: -10px;
+}
+
+/* Smaller inset for tightly-stacked inline items to avoid overlapping neighbors */
+.check-btn-sm::after {
+  content: '';
+  position: absolute;
+  inset: -6px;
 }
 
 .trip-card-meta {
@@ -289,6 +316,7 @@ body {
 .event-item:active { background: var(--gray1); }
 
 .event-drag-handle {
+  position: relative;
   align-self: center;
   flex-shrink: 0;
   background: none;
@@ -308,11 +336,15 @@ body {
 .drag-ghost {
   position: fixed;
   z-index: 999;
+  max-width: calc(100vw - 16px);
   pointer-events: none;
   opacity: .92;
   box-shadow: 0 8px 24px rgba(0,0,0,.25);
   border-radius: 10px;
+  overflow: hidden;
 }
+
+.drag-ghost .event-drag-handle { display: none; }
 
 .drag-source-hidden { opacity: .25; }
 
@@ -384,6 +416,7 @@ body {
 .list-item.item-done { opacity: .5; }
 
 .check-btn {
+  position: relative;
   width: 24px;
   height: 24px;
   border-radius: 99px;
@@ -542,6 +575,7 @@ body {
 }
 
 .check-btn-sm {
+  position: relative;
   width: 18px;
   height: 18px;
   border-radius: 99px;
@@ -599,6 +633,7 @@ body {
 
 /* ── Delete button on items ── */
 .btn-del {
+  position: relative;
   width: 26px;
   height: 26px;
   border: none;
