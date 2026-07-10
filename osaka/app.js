@@ -200,11 +200,19 @@ function setTab(tab) { S.tab = tab; renderDetail(); syncTabBar(); }
 
 // ─── Top-level Render ────────────────────────────────────────────────────────
 
+const BACK_BTN_HTML = `
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+  返回`;
+
+const IMPORT_BTN_HTML = `
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><polyline points="7 10 12 15 17 10"/><path d="M4 19h16"/></svg>
+  匯入`;
+
 function render() {
   const isDetail = S.view === 'detail';
 
   // Header
-  $('btn-back').style.display = isDetail ? '' : 'none';
+  $('btn-back').innerHTML = isDetail ? BACK_BTN_HTML : IMPORT_BTN_HTML;
   $('header-title').textContent = isDetail
     ? (DB.trip(S.tripId)?.name || '行程') : '我的行程';
 
@@ -262,6 +270,7 @@ function tripCard(trip) {
         </div>
         <div class="trip-card-actions">
           ${st ? `<span class="trip-status ${STATUS_CLASS[st]}">${STATUS_LABEL[st]}</span>` : ''}
+          <button class="btn-icon-sm" data-action="export-trip" data-id="${esc(trip.id)}" title="分享/匯出">⬆</button>
           <button class="btn-icon-sm" data-action="delete-trip" data-id="${esc(trip.id)}">✕</button>
         </div>
       </div>
@@ -692,6 +701,91 @@ function locCard(loc) {
       </div>
       <button class="btn-del" data-action="delete-location" data-id="${esc(loc.id)}">✕</button>
     </div>`;
+}
+
+// ─── Import / Export ─────────────────────────────────────────────────────────
+
+function safeFileName(name) {
+  return (name || '行程').replace(/[\\/:*?"<>|]/g, '').trim() || '行程';
+}
+
+async function exportTrip(tripId) {
+  const trip = DB.trip(tripId);
+  if (!trip) return;
+
+  const payload = {
+    app:       'osaka-trip-planner',
+    version:   1,
+    trip,
+    events:    DB.events(tripId),
+    shopping:  DB.shopping(tripId),
+    todos:     DB.todos(tripId),
+    locations: DB.locations(tripId),
+  };
+
+  const filename = `${safeFileName(trip.name)}.json`;
+  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+  const file = new File([blob], filename, { type: 'application/json' });
+
+  if (navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: trip.name });
+      return;
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+    }
+  }
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function importTripFile(file) {
+  let data;
+  try {
+    data = JSON.parse(await file.text());
+  } catch {
+    alert('這不是有效的行程檔案'); return;
+  }
+  if (!data?.trip?.name) { alert('這不是有效的行程檔案'); return; }
+
+  const newTripId = genId();
+  DB.saveTrip({ ...data.trip, id: newTripId });
+
+  const eventIdMap = new Map();
+  (data.events || []).forEach(ev => {
+    const newId = genId();
+    eventIdMap.set(ev.id, newId);
+    DB.saveEvent({ ...ev, id: newId, tripId: newTripId });
+  });
+
+  (data.shopping || []).forEach(item => {
+    DB.saveShop({
+      ...item,
+      id: genId(),
+      tripId: newTripId,
+      eventId: item.eventId ? (eventIdMap.get(item.eventId) || null) : null,
+    });
+  });
+
+  (data.todos || []).forEach(item => {
+    DB.saveTodo({
+      ...item,
+      id: genId(),
+      tripId: newTripId,
+      eventId: item.eventId ? (eventIdMap.get(item.eventId) || null) : null,
+    });
+  });
+
+  (data.locations || []).forEach(loc => {
+    DB.saveLoc({ ...loc, id: genId(), tripId: newTripId });
+  });
+
+  render();
+  openTrip(newTripId);
 }
 
 // ─── Modal: Open ─────────────────────────────────────────────────────────────
@@ -1131,6 +1225,9 @@ document.addEventListener('click', e => {
         DB.deleteTrip(id); render();
       }); break;
 
+    case 'export-trip':
+      exportTrip(id); break;
+
     // ── Events ──
     case 'add-event':
       S.pendingDate = date; openModal('event'); break;
@@ -1342,8 +1439,17 @@ document.addEventListener('pointercancel', e => {
 
 // ─── Static Event Listeners ───────────────────────────────────────────────────
 
-$('btn-back').addEventListener('click', backToTrips);
+$('btn-back').addEventListener('click', () => {
+  if (S.view === 'detail') backToTrips();
+  else $('import-file-input').click();
+});
 $('btn-add').addEventListener('click', headerAdd);
+
+$('import-file-input').addEventListener('change', e => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (file) importTripFile(file);
+});
 
 $('event-has-time').addEventListener('change', e => {
   $('event-time-fields').style.display = e.target.checked ? '' : 'none';
