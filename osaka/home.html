@@ -152,6 +152,11 @@
           <label>備註</label>
           <textarea id="event-notes" placeholder="票價、注意事項..."></textarea>
         </div>
+        <div class="form-group">
+          <label>照片</label>
+          <div class="photo-strip" id="event-photo-strip"></div>
+          <input type="file" accept="image/*" multiple data-photo-kind="event" class="photo-file-input" id="event-photos-input">
+        </div>
       </div>
     </div>
 
@@ -189,6 +194,11 @@
           <label>備註</label>
           <textarea id="shopping-notes" placeholder="哪裡買、備注..."></textarea>
         </div>
+        <div class="form-group">
+          <label>照片</label>
+          <div class="photo-strip" id="shopping-photo-strip"></div>
+          <input type="file" accept="image/*" multiple data-photo-kind="shopping" class="photo-file-input" id="shopping-photos-input">
+        </div>
       </div>
     </div>
 
@@ -225,6 +235,11 @@
         <div class="form-group">
           <label>備註</label>
           <textarea id="todo-notes" placeholder="備注..."></textarea>
+        </div>
+        <div class="form-group">
+          <label>照片</label>
+          <div class="photo-strip" id="todo-photo-strip"></div>
+          <input type="file" accept="image/*" multiple data-photo-kind="todo" class="photo-file-input" id="todo-photos-input">
         </div>
       </div>
     </div>
@@ -290,6 +305,11 @@
     </div>
 
   </div><!-- /modal-overlay -->
+
+  <!-- Photo lightbox -->
+  <div id="photo-lightbox" style="display:none">
+    <img id="photo-lightbox-img" src="" alt="">
+  </div>
 
 </div><!-- /app -->
 <script src="app.js"></script>

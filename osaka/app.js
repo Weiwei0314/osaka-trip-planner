@@ -102,7 +102,14 @@ function esc(str) {
 
 const DB = {
   _read(k)    { try { return JSON.parse(localStorage.getItem(k)) || []; } catch { return []; } },
-  _write(k,v) { localStorage.setItem(k, JSON.stringify(v)); },
+  _write(k,v) {
+    try {
+      localStorage.setItem(k, JSON.stringify(v));
+    } catch (err) {
+      alert('儲存失敗，瀏覽器儲存空間可能已滿（通常是照片太多）。請刪除一些照片或項目後再試一次。');
+      throw err;
+    }
+  },
 
   // ── Trips ──
   trips()      { return this._read('trips'); },
@@ -168,7 +175,10 @@ const S = {
   pendingDate:    null,
   pendingEventId: null,
   confirmCb:      null,
+  editPhotos:     [],
 };
+
+const MAX_PHOTOS_PER_ITEM = 6;
 
 // ─── DOM Shorthand ───────────────────────────────────────────────────────────
 
@@ -374,6 +384,16 @@ function groupByEventId(items) {
   return map;
 }
 
+function photoThumbsHtml(photos) {
+  if (!photos || !photos.length) return '';
+  const shown = photos.slice(0, 4);
+  return `
+    <div class="item-photos">
+      ${shown.map(src => `<img src="${src}" class="item-photo-thumb" data-action="view-photo" data-src="${esc(src)}">`).join('')}
+      ${photos.length > shown.length ? `<span class="item-photo-more">+${photos.length - shown.length}</span>` : ''}
+    </div>`;
+}
+
 function eventItem(ev, shopByEvent, todoByEvent) {
   const icon    = CAT_ICON[ev.category] || '📌';
   const timeStr = ev.startTime
@@ -414,6 +434,7 @@ function eventItem(ev, shopByEvent, todoByEvent) {
         ${timeStr     ? `<div class="event-meta">⏰ ${esc(timeStr)}</div>`    : ''}
         ${ev.location ? `<div class="event-meta">📍 ${esc(ev.location)}</div>`: ''}
         ${ev.notes    ? `<div class="event-notes">${esc(ev.notes)}</div>`     : ''}
+        ${photoThumbsHtml(ev.photos)}
       </div>
       <button class="btn-del" data-action="delete-event" data-id="${esc(ev.id)}">✕</button>
     </div>
@@ -514,6 +535,7 @@ function shopItem(item) {
         <div class="item-title">${esc(item.name)}</div>
         ${meta  ? `<div class="item-meta">${meta}</div>`               : ''}
         ${item.notes ? `<div class="item-notes">${esc(item.notes)}</div>` : ''}
+        ${photoThumbsHtml(item.photos)}
       </div>
       <button class="btn-del" data-action="delete-shopping" data-id="${esc(item.id)}">✕</button>
     </div>`;
@@ -616,6 +638,7 @@ function todoItem(todo) {
         <div class="item-title">${esc(todo.title)}</div>
         <div class="item-meta">${meta}</div>
         ${todo.notes ? `<div class="item-notes">${esc(todo.notes)}</div>` : ''}
+        ${photoThumbsHtml(todo.photos)}
       </div>
       <button class="btn-del" data-action="delete-todo" data-id="${esc(todo.id)}">✕</button>
     </div>`;
@@ -699,6 +722,66 @@ function fillTripForm(t) {
   $('trip-notes').value       = t?.notes       || '';
 }
 
+// ─── Photos ────────────────────────────────────────────────────────────────
+
+function initPhotos(kind, photos) {
+  S.editPhotos = photos ? [...photos] : [];
+  renderPhotoStrip(kind);
+}
+
+function renderPhotoStrip(kind) {
+  const strip = $(`${kind}-photo-strip`);
+  if (!strip) return;
+  strip.innerHTML = S.editPhotos.map((src, i) => `
+    <div class="photo-thumb">
+      <img src="${src}" data-action="view-photo" data-src="${esc(src)}">
+      <button type="button" class="photo-remove" data-action="remove-photo" data-index="${i}">✕</button>
+    </div>`).join('') +
+    (S.editPhotos.length < MAX_PHOTOS_PER_ITEM
+      ? `<button type="button" class="photo-add-tile" data-action="pick-photo" data-kind="${kind}">＋</button>`
+      : '');
+}
+
+function readAndCompressImage(file, maxDim = 1000, quality = 0.68) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('圖片讀取失敗'));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          const scale = maxDim / Math.max(width, height);
+          width  = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width; canvas.height = height;
+        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function handlePhotoFiles(kind, files) {
+  const room = MAX_PHOTOS_PER_ITEM - S.editPhotos.length;
+  if (room <= 0) { alert(`最多只能加 ${MAX_PHOTOS_PER_ITEM} 張照片`); return; }
+
+  const toProcess = files.filter(f => f.type.startsWith('image/')).slice(0, room);
+  for (const file of toProcess) {
+    try {
+      S.editPhotos.push(await readAndCompressImage(file));
+    } catch {
+      alert(`「${file.name}」讀取失敗，已略過`);
+    }
+  }
+  renderPhotoStrip(kind);
+}
+
 function fillEventForm(ev) {
   $('modal-event-title').textContent    = ev?.id ? '編輯行程項目' : '新增行程項目';
   $('event-title-input').value          = ev?.title     || '';
@@ -707,6 +790,7 @@ function fillEventForm(ev) {
   $('event-category').value             = ev?.category  || 'attraction';
   $('event-notes').value                = ev?.notes     || '';
   setupTimeWheels(ev?.startTime || '', ev?.endTime || '');
+  initPhotos('event', ev?.photos);
   S.pendingDate = null;
 }
 
@@ -827,6 +911,7 @@ function fillShoppingForm(item) {
   $('shopping-category').value = item?.category || '';
   $('shopping-notes').value    = item?.notes    || '';
   $('shopping-date').innerHTML = buildDayOptions(S.tripId, item?.date || S.pendingDate || '');
+  initPhotos('shopping', item?.photos);
 }
 
 function fillTodoForm(todo) {
@@ -836,6 +921,7 @@ function fillTodoForm(todo) {
   $('todo-priority').value    = todo?.priority     || 'medium';
   $('todo-notes').value       = todo?.notes        || '';
   $('todo-assigned-date').innerHTML = buildDayOptions(S.tripId, todo?.assignedDate || S.pendingDate || '');
+  initPhotos('todo', todo?.photos);
 }
 
 function fillMoveEventForm(ev) {
@@ -856,7 +942,7 @@ function closeModal() {
   $('modal-overlay').style.display = 'none';
   document.querySelectorAll('.modal').forEach(m => m.style.display = 'none');
   S.modal = null; S.editId = null; S.confirmCb = null;
-  S.pendingDate = null; S.pendingEventId = null;
+  S.pendingDate = null; S.pendingEventId = null; S.editPhotos = [];
 }
 
 
@@ -915,6 +1001,7 @@ function saveEventForm() {
     location:  $('event-location-input').value.trim(),
     category:  $('event-category').value,
     notes:     $('event-notes').value.trim(),
+    photos:    [...S.editPhotos],
   });
   closeModal();
   renderDetail();
@@ -962,6 +1049,7 @@ function saveShoppingForm() {
     purchased: existing?.purchased || false,
     date:      $('shopping-date').value || S.pendingDate || '',
     eventId:   S.pendingEventId || existing?.eventId || null,
+    photos:    [...S.editPhotos],
   });
   closeModal();
   renderDetail();
@@ -981,6 +1069,7 @@ function saveTodoForm() {
     completed:    existing?.completed || false,
     assignedDate: $('todo-assigned-date').value || S.pendingDate || '',
     eventId:      S.pendingEventId || existing?.eventId || null,
+    photos:       [...S.editPhotos],
   });
   closeModal();
   renderDetail();
@@ -1115,7 +1204,33 @@ document.addEventListener('click', e => {
       showConfirm('確定要刪除這個地點？', () => {
         DB.deleteLoc(id); renderDetail();
       }); break;
+
+    // ── Photos ──
+    case 'pick-photo':
+      $(`${el.dataset.kind}-photos-input`).click();
+      break;
+
+    case 'remove-photo':
+      S.editPhotos.splice(Number(el.dataset.index), 1);
+      renderPhotoStrip(S.modal);
+      break;
+
+    case 'view-photo':
+      $('photo-lightbox-img').src = el.dataset.src;
+      $('photo-lightbox').style.display = 'flex';
+      break;
   }
+});
+
+document.addEventListener('change', e => {
+  const input = e.target.closest('.photo-file-input');
+  if (!input || !input.files.length) return;
+  handlePhotoFiles(input.dataset.photoKind, [...input.files]);
+  input.value = '';
+});
+
+$('photo-lightbox').addEventListener('click', () => {
+  $('photo-lightbox').style.display = 'none';
 });
 
 // ─── Event Card Drag & Drop ───────────────────────────────────────────────────
