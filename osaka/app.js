@@ -1034,8 +1034,9 @@ async function exportTrip(tripId) {
   showProcessing('準備匯出檔案，請稍候...');
   try {
     const payload = {
-      app:       'osaka-trip-planner',
-      version:   2,
+      app:        'osaka-trip-planner',
+      version:    2,
+      exportedAt: new Date().toISOString(),
       trip,
       events:    await inlinePhotosForExport(DB.events(tripId)),
       shopping:  await inlinePhotosForExport(DB.shopping(tripId)),
