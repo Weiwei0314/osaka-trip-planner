@@ -884,6 +884,11 @@ textarea {
   overflow: hidden;
 }
 
+#event-location-input,
+#location-address {
+  min-height: 44px;
+}
+
 .checkbox-label {
   display: flex;
   align-items: center;
