@@ -92,6 +92,11 @@ body {
   justify-content: flex-end;
 }
 
+.hdr-btn-group {
+  display: flex;
+  align-items: center;
+}
+
 /* ── Main / Screens ── */
 #app-main {
   flex: 1;
@@ -261,6 +266,77 @@ body {
   margin-top: 8px;
   font-size: 12px;
   color: var(--gray4);
+}
+
+/* ── Overview ── */
+.overview-content { padding-bottom: 16px; }
+
+.overview-hero { padding: 14px 16px 4px; }
+
+.overview-hero-title {
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.overview-stats {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px 4px;
+}
+
+.overview-stat {
+  flex: 1;
+  background: var(--card);
+  border-radius: 12px;
+  padding: 12px 6px;
+  text-align: center;
+  box-shadow: 0 1px 3px rgba(0,0,0,.07);
+}
+
+.overview-stat-num {
+  font-size: 19px;
+  font-weight: 700;
+  color: var(--blue);
+}
+
+.overview-stat-label {
+  font-size: 11px;
+  color: var(--gray4);
+  margin-top: 2px;
+}
+
+.overview-day-list { background: var(--card); }
+
+.overview-day-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--gray2);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.overview-day-row:last-child { border-bottom: none; }
+.overview-day-row:active { background: var(--gray1); }
+
+.overview-day-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.overview-day-today .overview-day-label { color: var(--blue); }
+
+.overview-day-preview {
+  font-size: 12px;
+  color: var(--gray4);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── Timeline ── */
@@ -652,6 +728,26 @@ body {
 
 .btn-del:active { color: var(--red); background: #FFE5E5; }
 
+.btn-copy {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  border: none;
+  background: none;
+  color: var(--gray3);
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border-radius: 99px;
+  -webkit-tap-highlight-color: transparent;
+  margin-top: 1px;
+}
+
+.btn-copy:active { color: var(--blue); background: #E3F0FF; }
+
 /* ── Modals ── */
 #modal-overlay {
   position: fixed;
@@ -973,6 +1069,33 @@ textarea {
   border-radius: 10px;
   object-fit: contain;
 }
+
+/* ── Processing overlay ── */
+#processing-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  background: rgba(0,0,0,.45);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: white;
+}
+
+.processing-spinner {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 3px solid rgba(255,255,255,.3);
+  border-top-color: white;
+  animation: processing-spin .8s linear infinite;
+}
+
+@keyframes processing-spin { to { transform: rotate(360deg); } }
+
+.processing-text { font-size: 14px; }
 
 /* ── Confirm modal ── */
 .confirm-body {

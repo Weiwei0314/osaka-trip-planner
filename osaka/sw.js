@@ -1,4 +1,4 @@
-const CACHE = 'trip-planner-v10';
+const CACHE = 'trip-planner-v15';
 const ASSETS = ['home.html', 'app.js', 'style.css', 'manifest.json', 'icon.svg'];
 
 self.addEventListener('install', e => {

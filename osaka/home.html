@@ -2,7 +2,7 @@
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="行程表">
@@ -19,11 +19,17 @@
   <header id="app-header">
     <button id="btn-back" class="hdr-btn"></button>
     <span id="header-title">我的行程</span>
-    <button id="btn-add" class="hdr-btn hdr-btn-add">
-      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-    </button>
+    <div class="hdr-btn-group">
+      <button id="btn-import-csv" class="hdr-btn" style="display:none" title="從 CSV 匯入">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v5h5"/><path d="M6 3h8l5 5v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M9 15h1"/><path d="M9 12h6"/><path d="M9 18h3"/></svg>
+      </button>
+      <button id="btn-add" class="hdr-btn hdr-btn-add">
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      </button>
+    </div>
   </header>
   <input type="file" accept=".json,application/json" id="import-file-input" style="display:none">
+  <input type="file" accept=".csv,text/csv" id="csv-file-input" style="display:none">
 
   <!-- ── Main content ── -->
   <main id="app-main">
@@ -33,7 +39,11 @@
 
   <!-- ── Bottom tab bar (detail screen only) ── -->
   <nav id="tab-bar" style="display:none">
-    <button class="tab-btn active" data-tab="timeline">
+    <button class="tab-btn active" data-tab="overview">
+      <svg width="27" height="27" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+      <span>總覽</span>
+    </button>
+    <button class="tab-btn" data-tab="timeline">
       <svg width="27" height="27" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
       <span>時間軸</span>
     </button>
@@ -291,6 +301,21 @@
       </div>
     </div>
 
+    <!-- Copy-to-trip modal -->
+    <div id="modal-copy" class="modal modal-sm" style="display:none">
+      <div class="modal-nav">
+        <button class="modal-cancel">取消</button>
+        <h3>複製到哪個行程</h3>
+        <button class="modal-done" id="save-copy">複製</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>目標行程</label>
+          <select id="copy-target-trip"></select>
+        </div>
+      </div>
+    </div>
+
     <!-- Confirm modal -->
     <div id="modal-confirm" class="modal modal-sm" style="display:none">
       <div class="modal-body confirm-body">
@@ -307,6 +332,12 @@
   <!-- Photo lightbox -->
   <div id="photo-lightbox" style="display:none">
     <img id="photo-lightbox-img" src="" alt="">
+  </div>
+
+  <!-- Processing overlay (import/export) -->
+  <div id="processing-overlay" style="display:none">
+    <div class="processing-spinner"></div>
+    <div class="processing-text" id="processing-text">處理中，請稍候...</div>
   </div>
 
 </div><!-- /app -->

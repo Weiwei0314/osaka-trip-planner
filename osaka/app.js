@@ -98,6 +98,136 @@ function esc(str) {
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// ─── Photo Storage (IndexedDB) ────────────────────────────────────────────────
+// Photos are stored as Blobs in IndexedDB, keyed by a small id. Every item's
+// `photos` array only holds these ids (not the image data itself) — this is
+// what lets photos live outside localStorage's ~5-10MB quota.
+
+const PHOTO_DB_NAME    = 'trip-planner-photos';
+const PHOTO_DB_VERSION = 1;
+const PHOTO_STORE      = 'photos';
+
+let _photoDbPromise = null;
+function openPhotoDb() {
+  if (_photoDbPromise) return _photoDbPromise;
+  _photoDbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(PHOTO_DB_NAME, PHOTO_DB_VERSION);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(PHOTO_STORE)) {
+        req.result.createObjectStore(PHOTO_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+  return _photoDbPromise;
+}
+
+async function savePhotoBlob(id, blob) {
+  const db = await openPhotoDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE, 'readwrite');
+    tx.objectStore(PHOTO_STORE).put(blob, id);
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+async function loadPhotoBlob(id) {
+  const db = await openPhotoDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(PHOTO_STORE, 'readonly').objectStore(PHOTO_STORE).get(id);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function deletePhotoBlobs(ids) {
+  if (!ids || !ids.length) return;
+  ids.forEach(revokePhotoUrl);
+  const db = await openPhotoDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE, 'readwrite');
+    const store = tx.objectStore(PHOTO_STORE);
+    ids.forEach(id => store.delete(id));
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+async function duplicatePhotoBlobs(ids) {
+  const newIds = [];
+  for (const id of (ids || [])) {
+    const blob = await loadPhotoBlob(id);
+    if (!blob) continue;
+    const newId = genId();
+    await savePhotoBlob(newId, blob);
+    newIds.push(newId);
+  }
+  return newIds;
+}
+
+// Object URLs are cached (one per photo id, reused across every re-render)
+// instead of being recreated/revoked on every render — far simpler than
+// tracking per-render lifecycles, and they're only released when the photo
+// itself is actually deleted.
+const photoUrlCache = new Map();
+
+async function getPhotoUrl(id) {
+  if (photoUrlCache.has(id)) return photoUrlCache.get(id);
+  const blob = await loadPhotoBlob(id);
+  if (!blob) return '';
+  const url = URL.createObjectURL(blob);
+  photoUrlCache.set(id, url);
+  return url;
+}
+
+function revokePhotoUrl(id) {
+  const url = photoUrlCache.get(id);
+  if (url) { URL.revokeObjectURL(url); photoUrlCache.delete(id); }
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload  = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+// One-time migration for data saved before this version: old items store
+// photos as inline Base64 data URLs directly in localStorage. Convert each
+// to a Blob in IndexedDB and replace the array entries with ids.
+async function migratePhotosToIndexedDB() {
+  if (localStorage.getItem('photosMigratedV1')) return;
+
+  for (const key of ['events', 'shopping', 'todos']) {
+    const list = DB._read(key);
+    let changed = false;
+    for (const item of list) {
+      if (!item.photos || !item.photos.length) continue;
+      const newIds = [];
+      for (const src of item.photos) {
+        if (typeof src === 'string' && src.startsWith('data:')) {
+          try {
+            const blob = await (await fetch(src)).blob();
+            const id = genId();
+            await savePhotoBlob(id, blob);
+            newIds.push(id);
+            changed = true;
+          } catch { /* skip photo that fails to migrate */ }
+        } else {
+          newIds.push(src);
+        }
+      }
+      item.photos = newIds;
+    }
+    if (changed) DB._write(key, list);
+  }
+  localStorage.setItem('photosMigratedV1', '1');
+}
+
 // ─── Data Layer (localStorage) ───────────────────────────────────────────────
 
 const DB = {
@@ -106,7 +236,7 @@ const DB = {
     try {
       localStorage.setItem(k, JSON.stringify(v));
     } catch (err) {
-      alert('儲存失敗，瀏覽器儲存空間可能已滿（通常是照片太多）。請刪除一些照片或項目後再試一次。');
+      alert('儲存失敗，瀏覽器儲存空間可能已滿。請刪除一些項目後再試一次。');
       throw err;
     }
   },
@@ -121,30 +251,48 @@ const DB = {
     this._write('trips', list);
   },
   deleteTrip(id) {
+    const photoIds = [
+      ...this.events(id).flatMap(e => e.photos || []),
+      ...this.shopping(id).flatMap(s => s.photos || []),
+      ...this.todos(id).flatMap(t => t.photos || []),
+    ];
     this._write('trips',     this.trips().filter(t => t.id !== id));
     this._write('events',    this._read('events').filter(e => e.tripId !== id));
     this._write('shopping',  this._read('shopping').filter(s => s.tripId !== id));
     this._write('todos',     this._read('todos').filter(t => t.tripId !== id));
     this._write('locations', this._read('locations').filter(l => l.tripId !== id));
+    if (photoIds.length) deletePhotoBlobs(photoIds).catch(() => {});
   },
 
   // ── Events ──
   events(tripId)   { return this._read('events').filter(e => e.tripId === tripId); },
   event(id)        { return this._read('events').find(e => e.id === id); },
   saveEvent(ev)    { this._saveItem('events', ev); },
-  deleteEvent(id)  { this._del('events', id); },
+  deleteEvent(id)  {
+    const photos = this.event(id)?.photos;
+    this._del('events', id);
+    if (photos?.length) deletePhotoBlobs(photos).catch(() => {});
+  },
 
   // ── Shopping ──
   shopping(tripId) { return this._read('shopping').filter(s => s.tripId === tripId); },
   shopItem(id)     { return this._read('shopping').find(s => s.id === id); },
   saveShop(item)   { this._saveItem('shopping', item); },
-  deleteShop(id)   { this._del('shopping', id); },
+  deleteShop(id)   {
+    const photos = this.shopItem(id)?.photos;
+    this._del('shopping', id);
+    if (photos?.length) deletePhotoBlobs(photos).catch(() => {});
+  },
 
   // ── Todos ──
   todos(tripId)   { return this._read('todos').filter(t => t.tripId === tripId); },
   todo(id)        { return this._read('todos').find(t => t.id === id); },
   saveTodo(todo)  { this._saveItem('todos', todo); },
-  deleteTodo(id)  { this._del('todos', id); },
+  deleteTodo(id)  {
+    const photos = this.todo(id)?.photos;
+    this._del('todos', id);
+    if (photos?.length) deletePhotoBlobs(photos).catch(() => {});
+  },
 
   // ── Locations ──
   locations(tripId)  { return this._read('locations').filter(l => l.tripId === tripId); },
@@ -169,16 +317,18 @@ const DB = {
 const S = {
   view:           'trips',   // 'trips' | 'detail'
   tripId:         null,
-  tab:            'timeline',
+  tab:            'overview',
   modal:          null,
   editId:         null,
   pendingDate:    null,
   pendingEventId: null,
   confirmCb:      null,
   editPhotos:     [],
+  copyType:       null,
+  copyItemId:     null,
 };
 
-const MAX_PHOTOS_PER_ITEM = 6;
+const MAX_PHOTOS_PER_ITEM = 20;
 
 // ─── DOM Shorthand ───────────────────────────────────────────────────────────
 
@@ -187,7 +337,7 @@ const $ = id => document.getElementById(id);
 // ─── Navigation ──────────────────────────────────────────────────────────────
 
 function openTrip(id) {
-  S.view = 'detail'; S.tripId = id; S.tab = 'timeline';
+  S.view = 'detail'; S.tripId = id; S.tab = 'overview';
   render();
 }
 
@@ -196,7 +346,7 @@ function backToTrips() {
   render();
 }
 
-function setTab(tab) { S.tab = tab; renderDetail(); syncTabBar(); }
+async function setTab(tab) { S.tab = tab; await renderDetail(); syncTabBar(); }
 
 // ─── Top-level Render ────────────────────────────────────────────────────────
 
@@ -208,7 +358,7 @@ const IMPORT_BTN_HTML = `
   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><polyline points="7 10 12 15 17 10"/><path d="M4 19h16"/></svg>
   匯入`;
 
-function render() {
+async function render() {
   const isDetail = S.view === 'detail';
 
   // Header
@@ -222,8 +372,9 @@ function render() {
 
   // Tab bar
   $('tab-bar').style.display = isDetail ? '' : 'none';
+  $('btn-import-csv').style.display = isDetail ? '' : 'none';
 
-  if (isDetail) { renderDetail(); syncTabBar(); }
+  if (isDetail) { await renderDetail(); syncTabBar(); }
   else          { renderTrips(); }
 }
 
@@ -288,12 +439,129 @@ function tripCard(trip) {
 
 // ─── Detail Screen Dispatch ───────────────────────────────────────────────────
 
-function renderDetail() {
+async function renderDetail() {
   switch (S.tab) {
-    case 'timeline': renderTimeline(); break;
-    case 'shopping': renderShopping(); break;
-    case 'todo':     renderTodo();     break;
+    case 'overview': await renderOverview(); break;
+    case 'timeline': await renderTimeline(); break;
+    case 'shopping': await renderShopping(); break;
+    case 'todo':     await renderTodo();     break;
   }
+}
+
+// ─── Overview ────────────────────────────────────────────────────────────────
+
+async function renderOverview() {
+  const trip = DB.trip(S.tripId);
+  const el   = $('screen-detail');
+  if (!trip) { el.innerHTML = ''; return; }
+
+  const events   = DB.events(S.tripId);
+  const shopping = DB.shopping(S.tripId);
+  const todos    = DB.todos(S.tripId);
+
+  const heroHtml  = overviewHeroHtml(trip);
+  const todoDone  = todos.filter(t => t.completed).length;
+  const budget    = shopping.reduce((s, i) => s + (parseFloat(i.price) || 0), 0);
+
+  const statsHtml = `
+    <div class="overview-stats">
+      <div class="overview-stat">
+        <div class="overview-stat-num">${events.length}</div>
+        <div class="overview-stat-label">行程項目</div>
+      </div>
+      <div class="overview-stat">
+        <div class="overview-stat-num">${todoDone}/${todos.length}</div>
+        <div class="overview-stat-label">代辦完成</div>
+      </div>
+      <div class="overview-stat">
+        <div class="overview-stat-num">${budget ? '¥' + budget.toLocaleString() : '—'}</div>
+        <div class="overview-stat-label">購物預估</div>
+      </div>
+    </div>`;
+
+  if (!events.length && !shopping.length && !todos.length) {
+    el.innerHTML = `
+      <div class="overview-content">
+        ${heroHtml}${statsHtml}
+        <div class="empty-state">
+          <div class="empty-icon">🧳</div>
+          <p class="empty-title">這個行程還是空的</p>
+          <p class="empty-desc">切到「時間軸」開始安排行程項目吧</p>
+        </div>
+      </div>`;
+    return;
+  }
+
+  let planHtml = '';
+  let dayHtml  = '';
+  if (trip.startDate && trip.endDate) {
+    const st    = tripStatus(trip);
+    const days  = getDays(trip.startDate, trip.endDate);
+    const today = todayStr();
+    const WD    = ['日','一','二','三','四','五','六'];
+
+    // Whole-trip, day-by-day plan at a glance — separate from the "today" detail below
+    const planRows = days.map((day, i) => {
+      const dayEvs = events.filter(e => e.date === day)
+        .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
+      const d = new Date(day + 'T00:00:00');
+      const label = `第${i + 1}天・${d.getMonth() + 1}/${d.getDate()}(週${WD[d.getDay()]})`;
+      const preview = dayEvs.length
+        ? esc(dayEvs[0].title) + (dayEvs.length > 1 ? ` 等 ${dayEvs.length} 個行程` : '')
+        : '尚無安排';
+      return `
+        <div class="overview-day-row${day === today ? ' overview-day-today' : ''}" data-action="goto-day" data-date="${esc(day)}">
+          <span class="overview-day-label">${esc(label)}</span>
+          <span class="overview-day-preview">${preview}</span>
+        </div>`;
+    }).join('');
+    planHtml = `
+      <div class="day-group-header">🗓 整趟行程一覽</div>
+      <div class="overview-day-list">${planRows}</div>`;
+
+    if (st === 'ongoing' && days.includes(today)) {
+      const dayIdx   = days.indexOf(today);
+      const todayEvs = events.filter(e => e.date === today)
+        .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
+      dayHtml = `
+        <div class="day-group-header">📅 今天・第 ${dayIdx + 1} 天</div>
+        ${todayEvs.length
+          ? `<div class="item-list">${todayEvs.map(overviewEventRow).join('')}</div>`
+          : `<div class="day-empty">今天沒有安排行程</div>`}`;
+    }
+  }
+
+  const pendingTodos = todos.filter(t => !t.completed).sort(sortTodos).slice(0, 5);
+  const todoHtml = pendingTodos.length ? `
+    <div class="day-group-header">✅ 待辦事項（未完成）</div>
+    <div class="item-list">${(await Promise.all(pendingTodos.map(todoItem))).join('')}</div>` : '';
+
+  el.innerHTML = `<div class="overview-content">${heroHtml}${statsHtml}${planHtml}${dayHtml}${todoHtml}</div>`;
+}
+
+function overviewHeroHtml(trip) {
+  const st = tripStatus(trip);
+  const cd = countdown(trip.startDate);
+  let text;
+  if (!trip.startDate || !trip.endDate) text = '📅 尚未設定旅行日期';
+  else if (st === 'upcoming')           text = `✈️ ${cd || '即將出發'}`;
+  else if (st === 'ongoing')            text = '🌏 旅行進行中';
+  else                                  text = '🏁 行程已結束';
+  return `<div class="overview-hero"><div class="overview-hero-title">${text}</div></div>`;
+}
+
+function overviewEventRow(ev) {
+  const icon    = CAT_ICON[ev.category] || '📌';
+  const timeStr = ev.startTime
+    ? (ev.endTime ? `${ev.startTime}–${ev.endTime}` : ev.startTime)
+    : '';
+  return `
+    <div class="list-item" data-action="edit-event" data-id="${esc(ev.id)}">
+      <div class="item-body">
+        <div class="item-title">${icon} ${esc(ev.title)}</div>
+        ${timeStr ? `<div class="item-meta">⏰ ${esc(timeStr)}</div>` : ''}
+      </div>
+    </div>`;
 }
 
 // ─── Timeline ────────────────────────────────────────────────────────────────
@@ -303,11 +571,16 @@ const CAT_ICON = {
   accommodation:'🏨', shopping:'🛍', other:'📌',
 };
 
-function renderTimeline() {
+async function renderTimeline() {
   const trip = DB.trip(S.tripId);
   const el   = $('screen-detail');
 
-  if (!trip?.startDate || !trip?.endDate) {
+  const days     = getDays(trip?.startDate, trip?.endDate);
+  const events   = DB.events(S.tripId);
+  const shopping = DB.shopping(S.tripId);
+  const todos    = DB.todos(S.tripId);
+
+  if (!days.length && !events.length && !shopping.length && !todos.length) {
     el.innerHTML = `
       <div class="empty-state">
         <div class="empty-icon">📅</div>
@@ -322,22 +595,22 @@ function renderTimeline() {
     return;
   }
 
-  const days     = getDays(trip.startDate, trip.endDate);
-  const events   = DB.events(S.tripId);
-  const shopping = DB.shopping(S.tripId);
-  const todos    = DB.todos(S.tripId);
-  const WD       = ['日','一','二','三','四','五','六'];
+  const WD = ['日','一','二','三','四','五','六'];
 
   // Items added directly in Shopping/Todo tabs (no eventId) with no valid day-of-trip date
   const noDateShop = shopping.filter(s => !s.eventId && !(s.date && days.includes(s.date)));
   const noDateTodo = todos.filter(t => !t.eventId && !(t.assignedDate && days.includes(t.assignedDate)));
-  const noDateHtml = standaloneListsHtml(noDateShop, noDateTodo);
+  // Events whose date doesn't fall within this trip's date range (e.g. copied in from another trip, or trip has no dates set)
+  const noDateEvents = events.filter(e => !(e.date && days.includes(e.date)));
 
   // Group by eventId once instead of re-filtering the full lists inside eventItem() per event
   const shopByEvent = groupByEventId(shopping);
   const todoByEvent = groupByEventId(todos);
 
-  const html = days.map((day, i) => {
+  const noDateEventsHtml = (await Promise.all(noDateEvents.map(ev => eventItem(ev, shopByEvent, todoByEvent)))).join('');
+  const noDateHtml = await standaloneListsHtml(noDateShop, noDateTodo);
+
+  const html = (await Promise.all(days.map(async (day, i) => {
     const d        = new Date(day + 'T00:00:00');
     const label    = `第 ${i+1} 天 · ${d.getMonth()+1}/${d.getDate()} (週${WD[d.getDay()]})`;
     const dayEvs   = events
@@ -347,7 +620,10 @@ function renderTimeline() {
     // Items added directly in Shopping/Todo tabs for this day (no eventId)
     const dayShop        = shopping.filter(s => !s.eventId && s.date === day);
     const dayTodo        = todos.filter(t => !t.eventId && t.assignedDate === day);
-    const standaloneHtml = standaloneListsHtml(dayShop, dayTodo);
+    const standaloneHtml = await standaloneListsHtml(dayShop, dayTodo);
+    const dayEvsHtml = dayEvs.length
+      ? (await Promise.all(dayEvs.map(ev => eventItem(ev, shopByEvent, todoByEvent)))).join('')
+      : '';
 
     return `
       <div class="day-section" data-date="${esc(day)}">
@@ -356,30 +632,33 @@ function renderTimeline() {
           <button class="btn-add-inline" data-action="add-event" data-date="${esc(day)}">＋ 新增</button>
         </div>
         ${dayEvs.length
-          ? dayEvs.map(ev => eventItem(ev, shopByEvent, todoByEvent)).join('')
+          ? dayEvsHtml
           : (standaloneHtml ? '' : `<div class="day-empty">尚無行程，點「新增」加入</div>`)}
         ${standaloneHtml}
       </div>`;
-  }).join('');
+  }))).join('');
 
-  const noDateSection = noDateHtml ? `
+  const noDateSection = (noDateEventsHtml || noDateHtml) ? `
     <div class="day-section">
       <div class="day-header"><span class="day-label">整個行程</span></div>
+      ${noDateEventsHtml}
       ${noDateHtml}
     </div>` : '';
 
   el.innerHTML = `<div class="timeline-content">${noDateSection}${html}</div>`;
 }
 
-function standaloneListsHtml(shopItems, todoItems) {
+async function standaloneListsHtml(shopItems, todoItems) {
   if (!shopItems.length && !todoItems.length) return '';
+  const shopHtml = shopItems.length ? (await Promise.all(shopItems.map(shopItem))).join('') : '';
+  const todoHtml = todoItems.length ? (await Promise.all(todoItems.sort(sortTodos).map(todoItem))).join('') : '';
   return `
     ${shopItems.length ? `
       <div class="event-sub-header">🛒 購物（未排入行程項目）</div>
-      <div class="item-list">${shopItems.map(shopItem).join('')}</div>` : ''}
+      <div class="item-list">${shopHtml}</div>` : ''}
     ${todoItems.length ? `
       <div class="event-sub-header">✅ 代辦（未排入行程項目）</div>
-      <div class="item-list">${todoItems.sort(sortTodos).map(todoItem).join('')}</div>` : ''}
+      <div class="item-list">${todoHtml}</div>` : ''}
   `;
 }
 
@@ -393,17 +672,18 @@ function groupByEventId(items) {
   return map;
 }
 
-function photoThumbsHtml(photos) {
-  if (!photos || !photos.length) return '';
-  const shown = photos.slice(0, 4);
+async function photoThumbsHtml(photoIds) {
+  if (!photoIds || !photoIds.length) return '';
+  const shown = photoIds.slice(0, 4);
+  const urls  = await Promise.all(shown.map(getPhotoUrl));
   return `
     <div class="item-photos">
-      ${shown.map(src => `<img src="${src}" class="item-photo-thumb" data-action="view-photo" data-src="${esc(src)}">`).join('')}
-      ${photos.length > shown.length ? `<span class="item-photo-more">+${photos.length - shown.length}</span>` : ''}
+      ${urls.map(url => `<img src="${url}" class="item-photo-thumb" data-action="view-photo" data-src="${esc(url)}">`).join('')}
+      ${photoIds.length > shown.length ? `<span class="item-photo-more">+${photoIds.length - shown.length}</span>` : ''}
     </div>`;
 }
 
-function eventItem(ev, shopByEvent, todoByEvent) {
+async function eventItem(ev, shopByEvent, todoByEvent) {
   const icon    = CAT_ICON[ev.category] || '📌';
   const timeStr = ev.startTime
     ? (ev.endTime ? `${ev.startTime}–${ev.endTime}` : ev.startTime)
@@ -411,6 +691,7 @@ function eventItem(ev, shopByEvent, todoByEvent) {
 
   const shopItems = shopByEvent.get(ev.id) || [];
   const todoItems = todoByEvent.get(ev.id) || [];
+  const photosHtml = await photoThumbsHtml(ev.photos);
 
   const shopHtml = shopItems.length ? `
     <div class="inline-list-header">🛒 購物 (${shopItems.length})</div>
@@ -443,7 +724,7 @@ function eventItem(ev, shopByEvent, todoByEvent) {
         ${timeStr     ? `<div class="event-meta">⏰ ${esc(timeStr)}</div>`    : ''}
         ${ev.location ? `<div class="event-meta">📍 ${esc(ev.location)}</div>`: ''}
         ${ev.notes    ? `<div class="event-notes">${esc(ev.notes)}</div>`     : ''}
-        ${photoThumbsHtml(ev.photos)}
+        ${photosHtml}
       </div>
       <button class="btn-del" data-action="delete-event" data-id="${esc(ev.id)}">✕</button>
     </div>
@@ -454,12 +735,13 @@ function eventItem(ev, shopByEvent, todoByEvent) {
       <button class="btn-add-sub" data-action="add-event-todo"
         data-event-id="${esc(ev.id)}" data-date="${esc(ev.date || '')}">＋ 代辦</button>
       <button class="btn-add-sub" data-action="move-event" data-id="${esc(ev.id)}">📅 移動</button>
+      <button class="btn-add-sub" data-action="copy-event" data-id="${esc(ev.id)}">📋 複製到其他行程</button>
     </div>`;
 }
 
 // ─── Shopping ────────────────────────────────────────────────────────────────
 
-function renderShopping() {
+async function renderShopping() {
   const items     = DB.shopping(S.tripId);
   const trip      = DB.trip(S.tripId);
   const days      = getDays(trip?.startDate, trip?.endDate);
@@ -495,44 +777,49 @@ function renderShopping() {
     else noDate.push(item);
   });
 
-  days.forEach((day, i) => {
+  for (let i = 0; i < days.length; i++) {
+    const day = days[i];
     const dayItems = byDate[day];
-    if (!dayItems?.length) return;
+    if (!dayItems?.length) continue;
     const d = new Date(day + 'T00:00:00');
     html += `<div class="day-group-header">第${i+1}天 · ${d.getMonth()+1}/${d.getDate()} (週${WD[d.getDay()]})</div>`;
 
     const dayEvs = allEvs.filter(e => e.date === day)
       .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
     const shown = new Set();
-    dayEvs.forEach(ev => {
+    for (const ev of dayEvs) {
       const evItems = dayItems.filter(item => item.eventId === ev.id);
-      if (!evItems.length) return;
+      if (!evItems.length) continue;
       const t = ev.startTime ? `${ev.startTime} ` : '';
+      const evItemsHtml = (await Promise.all(evItems.map(shopItem))).join('');
       html += `<div class="event-sub-header">${esc(t + ev.title)}</div>
-               <div class="item-list">${evItems.map(shopItem).join('')}</div>`;
+               <div class="item-list">${evItemsHtml}</div>`;
       evItems.forEach(item => shown.add(item.id));
-    });
+    }
     const orphans = dayItems.filter(item => !shown.has(item.id));
     if (orphans.length) {
+      const orphansHtml = (await Promise.all(orphans.map(shopItem))).join('');
       html += `<div class="event-sub-header">其他</div>
-               <div class="item-list">${orphans.map(shopItem).join('')}</div>`;
+               <div class="item-list">${orphansHtml}</div>`;
     }
-  });
+  }
 
   if (noDate.length) {
+    const noDateHtml = (await Promise.all(noDate.map(shopItem))).join('');
     html += `<div class="day-group-header">整個行程</div>
-             <div class="item-list">${noDate.map(shopItem).join('')}</div>`;
+             <div class="item-list">${noDateHtml}</div>`;
   }
 
   $('screen-detail').innerHTML = html;
 }
 
-function shopItem(item) {
+async function shopItem(item) {
   const meta = [
     item.qty      ? `數量：${esc(item.qty)}`   : '',
     item.price    ? `¥${esc(item.price)}`      : '',
     item.category ? esc(item.category)         : '',
   ].filter(Boolean).join(' · ');
+  const photosHtml = await photoThumbsHtml(item.photos);
 
   return `
     <div class="list-item${item.purchased ? ' item-done' : ''}" data-action="edit-shopping" data-id="${esc(item.id)}">
@@ -544,8 +831,9 @@ function shopItem(item) {
         <div class="item-title">${esc(item.name)}</div>
         ${meta  ? `<div class="item-meta">${meta}</div>`               : ''}
         ${item.notes ? `<div class="item-notes">${esc(item.notes)}</div>` : ''}
-        ${photoThumbsHtml(item.photos)}
+        ${photosHtml}
       </div>
+      <button class="btn-copy" data-action="copy-shopping" data-id="${esc(item.id)}" title="複製到其他行程">📋</button>
       <button class="btn-del" data-action="delete-shopping" data-id="${esc(item.id)}">✕</button>
     </div>`;
 }
@@ -564,7 +852,7 @@ function sortTodos(a, b) {
   return (PRIO_ORDER[a.priority] ?? 1) - (PRIO_ORDER[b.priority] ?? 1);
 }
 
-function renderTodo() {
+async function renderTodo() {
   const todos     = DB.todos(S.tripId);
   const trip      = DB.trip(S.tripId);
   const days      = getDays(trip?.startDate, trip?.endDate);
@@ -598,44 +886,49 @@ function renderTodo() {
     else noDate.push(t);
   });
 
-  days.forEach((day, i) => {
+  for (let i = 0; i < days.length; i++) {
+    const day = days[i];
     const dayTodos = byDate[day];
-    if (!dayTodos?.length) return;
+    if (!dayTodos?.length) continue;
     const d = new Date(day + 'T00:00:00');
     html += `<div class="day-group-header">第${i+1}天 · ${d.getMonth()+1}/${d.getDate()} (週${WD[d.getDay()]})</div>`;
 
     const dayEvs = allEvs.filter(e => e.date === day)
       .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
     const shown = new Set();
-    dayEvs.forEach(ev => {
+    for (const ev of dayEvs) {
       const evTodos = dayTodos.filter(t => t.eventId === ev.id);
-      if (!evTodos.length) return;
+      if (!evTodos.length) continue;
       const ti = ev.startTime ? `${ev.startTime} ` : '';
+      const evTodosHtml = (await Promise.all(evTodos.sort(sortTodos).map(todoItem))).join('');
       html += `<div class="event-sub-header">${esc(ti + ev.title)}</div>
-               <div class="item-list">${evTodos.sort(sortTodos).map(todoItem).join('')}</div>`;
+               <div class="item-list">${evTodosHtml}</div>`;
       evTodos.forEach(t => shown.add(t.id));
-    });
+    }
     const orphans = dayTodos.filter(t => !shown.has(t.id)).sort(sortTodos);
     if (orphans.length) {
+      const orphansHtml = (await Promise.all(orphans.map(todoItem))).join('');
       html += `<div class="event-sub-header">其他</div>
-               <div class="item-list">${orphans.map(todoItem).join('')}</div>`;
+               <div class="item-list">${orphansHtml}</div>`;
     }
-  });
+  }
 
   if (noDate.length) {
+    const noDateHtml = (await Promise.all(noDate.sort(sortTodos).map(todoItem))).join('');
     html += `<div class="day-group-header">整個行程</div>
-             <div class="item-list">${noDate.sort(sortTodos).map(todoItem).join('')}</div>`;
+             <div class="item-list">${noDateHtml}</div>`;
   }
 
   $('screen-detail').innerHTML = html;
 }
 
-function todoItem(todo) {
+async function todoItem(todo) {
   const p    = PRIO[todo.priority] || PRIO.medium;
   const meta = [
     `<span class="priority-emoji">${p.emoji}</span>${p.label}`,
     todo.dueDate ? `截止 ${formatDate(todo.dueDate)}` : '',
   ].filter(Boolean).join(' · ');
+  const photosHtml = await photoThumbsHtml(todo.photos);
 
   return `
     <div class="list-item${todo.completed ? ' item-done' : ''}" data-action="edit-todo" data-id="${esc(todo.id)}">
@@ -647,8 +940,9 @@ function todoItem(todo) {
         <div class="item-title">${esc(todo.title)}</div>
         <div class="item-meta">${meta}</div>
         ${todo.notes ? `<div class="item-notes">${esc(todo.notes)}</div>` : ''}
-        ${photoThumbsHtml(todo.photos)}
+        ${photosHtml}
       </div>
+      <button class="btn-copy" data-action="copy-todo" data-id="${esc(todo.id)}" title="複製到其他行程">📋</button>
       <button class="btn-del" data-action="delete-todo" data-id="${esc(todo.id)}">✕</button>
     </div>`;
 }
@@ -709,38 +1003,83 @@ function safeFileName(name) {
   return (name || '行程').replace(/[\\/:*?"<>|]/g, '').trim() || '行程';
 }
 
+function showProcessing(text) {
+  $('processing-text').textContent = text || '處理中，請稍候...';
+  $('processing-overlay').style.display = 'flex';
+}
+
+function hideProcessing() {
+  $('processing-overlay').style.display = 'none';
+}
+
+// Photos within one item, and items within one list, are all independent —
+// process them concurrently instead of one-at-a-time. With real phone photos
+// (much bigger than a test image) a sequential loop could take long enough,
+// with zero visual feedback, to look like the app had frozen.
+async function inlinePhotosForExport(items) {
+  return Promise.all(items.map(async item => {
+    if (!item.photos || !item.photos.length) return item;
+    const dataUrls = (await Promise.all(item.photos.map(async id => {
+      const blob = await loadPhotoBlob(id);
+      return blob ? blobToDataUrl(blob) : null;
+    }))).filter(Boolean);
+    return { ...item, photos: dataUrls };
+  }));
+}
+
 async function exportTrip(tripId) {
   const trip = DB.trip(tripId);
   if (!trip) return;
 
-  const payload = {
-    app:       'osaka-trip-planner',
-    version:   1,
-    trip,
-    events:    DB.events(tripId),
-    shopping:  DB.shopping(tripId),
-    todos:     DB.todos(tripId),
-    locations: DB.locations(tripId),
-  };
+  showProcessing('準備匯出檔案，請稍候...');
+  try {
+    const payload = {
+      app:       'osaka-trip-planner',
+      version:   2,
+      trip,
+      events:    await inlinePhotosForExport(DB.events(tripId)),
+      shopping:  await inlinePhotosForExport(DB.shopping(tripId)),
+      todos:     await inlinePhotosForExport(DB.todos(tripId)),
+      locations: DB.locations(tripId),
+    };
 
-  const filename = `${safeFileName(trip.name)}.json`;
-  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-  const file = new File([blob], filename, { type: 'application/json' });
+    const filename = `${safeFileName(trip.name)}.json`;
+    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    const file = new File([blob], filename, { type: 'application/json' });
 
-  if (navigator.canShare?.({ files: [file] })) {
-    try {
-      await navigator.share({ files: [file], title: trip.name });
-      return;
-    } catch (err) {
-      if (err.name === 'AbortError') return;
+    if (navigator.canShare?.({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: trip.name });
+        return;
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+      }
     }
-  }
 
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click(); a.remove();
-  URL.revokeObjectURL(url);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  } finally {
+    hideProcessing();
+  }
+}
+
+async function importPhotosFromDataUrls(photos) {
+  if (!photos || !photos.length) return [];
+  const ids = await Promise.all(photos.map(async src => {
+    if (typeof src !== 'string' || !src.startsWith('data:')) return null;
+    try {
+      const blob = await (await fetch(src)).blob();
+      const id = genId();
+      await savePhotoBlob(id, blob);
+      return id;
+    } catch {
+      return null; // skip photo that fails to import
+    }
+  }));
+  return ids.filter(Boolean);
 }
 
 async function importTripFile(file) {
@@ -752,40 +1091,246 @@ async function importTripFile(file) {
   }
   if (!data?.trip?.name) { alert('這不是有效的行程檔案'); return; }
 
-  const newTripId = genId();
-  DB.saveTrip({ ...data.trip, id: newTripId });
+  showProcessing('匯入中，請稍候...');
+  try {
+    const newTripId = genId();
+    DB.saveTrip({ ...data.trip, id: newTripId });
 
-  const eventIdMap = new Map();
-  (data.events || []).forEach(ev => {
-    const newId = genId();
-    eventIdMap.set(ev.id, newId);
-    DB.saveEvent({ ...ev, id: newId, tripId: newTripId });
-  });
+    // Generate every event's new id up front (synchronous) so the map is
+    // complete before shopping/todos need it, then process each list's
+    // items (photo import + save) concurrently rather than one at a time.
+    const eventIdMap = new Map();
+    (data.events || []).forEach(ev => eventIdMap.set(ev.id, genId()));
 
-  (data.shopping || []).forEach(item => {
-    DB.saveShop({
-      ...item,
-      id: genId(),
-      tripId: newTripId,
-      eventId: item.eventId ? (eventIdMap.get(item.eventId) || null) : null,
+    await Promise.all((data.events || []).map(async ev => {
+      const photos = await importPhotosFromDataUrls(ev.photos);
+      DB.saveEvent({ ...ev, id: eventIdMap.get(ev.id), tripId: newTripId, photos });
+    }));
+
+    await Promise.all((data.shopping || []).map(async item => {
+      const photos = await importPhotosFromDataUrls(item.photos);
+      DB.saveShop({
+        ...item,
+        id: genId(),
+        tripId: newTripId,
+        eventId: item.eventId ? (eventIdMap.get(item.eventId) || null) : null,
+        photos,
+      });
+    }));
+
+    await Promise.all((data.todos || []).map(async item => {
+      const photos = await importPhotosFromDataUrls(item.photos);
+      DB.saveTodo({
+        ...item,
+        id: genId(),
+        tripId: newTripId,
+        eventId: item.eventId ? (eventIdMap.get(item.eventId) || null) : null,
+        photos,
+      });
+    }));
+
+    (data.locations || []).forEach(loc => {
+      DB.saveLoc({ ...loc, id: genId(), tripId: newTripId });
     });
-  });
 
-  (data.todos || []).forEach(item => {
-    DB.saveTodo({
-      ...item,
-      id: genId(),
-      tripId: newTripId,
-      eventId: item.eventId ? (eventIdMap.get(item.eventId) || null) : null,
+    render();
+    openTrip(newTripId);
+  } finally {
+    hideProcessing();
+  }
+}
+
+// ─── CSV Import ──────────────────────────────────────────────────────────────
+// Expected columns (header row, order doesn't matter):
+//   類型(type), 標題/名稱(title), 日期(date), 開始時間(startTime), 結束時間(endTime),
+//   分類(category), 地點/地址(location), 數量(qty), 金額(price),
+//   截止日期(dueDate), 優先度(priority), 備註(notes)
+// 類型 accepts: event/行程, shopping/購物, todo/代辦, location/地點
+// 分類(event/location) accepts: 景點/餐廳/交通/住宿/購物/其他 or the raw English code
+// 優先度 accepts: 高/中/低 or high/medium/low
+// 日期 accepts YYYY-MM-DD, YYYY/MM/DD, or an Excel date serial number
+
+const CSV_HEADER_ALIASES = {
+  type:      ['類型', 'type'],
+  title:     ['標題', '名稱', '品項名稱', '事項名稱', '地點名稱', 'title', 'name'],
+  date:      ['日期', 'date'],
+  startTime: ['開始時間', 'starttime', 'start'],
+  endTime:   ['結束時間', 'endtime', 'end'],
+  category:  ['分類', 'category'],
+  location:  ['地點', '地址', 'location', 'address'],
+  qty:       ['數量', 'qty', 'quantity'],
+  price:     ['金額', '價格', 'price'],
+  dueDate:   ['截止日期', 'duedate'],
+  priority:  ['優先度', '優先級', 'priority'],
+  notes:     ['備註', 'notes', 'note'],
+};
+
+const CSV_CATEGORY_MAP = {
+  '景點': 'attraction', '餐廳': 'food', '交通': 'transport',
+  '住宿': 'accommodation', '購物': 'shopping', '其他': 'other',
+  attraction: 'attraction', food: 'food', transport: 'transport',
+  accommodation: 'accommodation', shopping: 'shopping', other: 'other',
+};
+
+const CSV_PRIORITY_MAP = {
+  '高': 'high', '中': 'medium', '低': 'low',
+  high: 'high', medium: 'medium', low: 'low',
+};
+
+const CSV_TYPE_MAP = {
+  event: 'event', '行程': 'event', '時間軸': 'event',
+  shopping: 'shopping', '購物': 'shopping',
+  todo: 'todo', '代辦': 'todo', '待辦': 'todo',
+  location: 'location', '地點': 'location', '收藏': 'location',
+};
+
+function resolveCsvHeaderKey(rawHeader) {
+  const h = rawHeader.trim();
+  const hLower = h.toLowerCase();
+  for (const [key, aliases] of Object.entries(CSV_HEADER_ALIASES)) {
+    if (aliases.some(a => a === h || a === hLower)) return key;
+  }
+  return null;
+}
+
+function normalizeCsvType(v)     { return CSV_TYPE_MAP[(v || '').trim()] ?? CSV_TYPE_MAP[(v || '').trim().toLowerCase()] ?? null; }
+function normalizeCsvCategory(v) { return CSV_CATEGORY_MAP[(v || '').trim()] ?? CSV_CATEGORY_MAP[(v || '').trim().toLowerCase()] ?? ''; }
+function normalizeCsvPriority(v) { return CSV_PRIORITY_MAP[(v || '').trim()] ?? CSV_PRIORITY_MAP[(v || '').trim().toLowerCase()] ?? ''; }
+
+function excelSerialToDateStr(serial) {
+  const utcMs = Math.round((serial - 25569) * 86400 * 1000);
+  const d = new Date(utcMs);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
+function normalizeCsvDate(v) {
+  const s = (v || '').trim();
+  if (!s) return '';
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    if (n > 20000 && n < 60000) return excelSerialToDateStr(n);
+  }
+  const m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (m) return `${m[1]}-${pad2(Number(m[2]))}-${pad2(Number(m[3]))}`;
+  return s;
+}
+
+function normalizeCsvTime(v) {
+  const s = (v || '').trim();
+  if (!s) return '';
+  const m = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm)?$/i);
+  if (!m) return s;
+  let h = Number(m[1]);
+  if (m[3]) {
+    const ap = m[3].toLowerCase();
+    if (ap === 'pm' && h < 12) h += 12;
+    if (ap === 'am' && h === 12) h = 0;
+  }
+  return `${pad2(h)}:${m[2]}`;
+}
+
+function parseCSV(text) {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\r') { /* skip */ }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else field += c;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => !(r.length === 1 && r[0].trim() === ''));
+}
+
+async function importCsvFile(file) {
+  const text = await file.text();
+  const rows = parseCSV(text);
+  if (rows.length < 2) { alert('CSV 檔案是空的，或只有標題列'); return; }
+
+  const keyMap = rows[0].map(resolveCsvHeaderKey);
+  if (!keyMap.includes('type') || !keyMap.includes('title')) {
+    alert('CSV 缺少必要欄位：請確認有「類型」與「標題/名稱」欄位'); return;
+  }
+
+  let ok = 0;
+  const errors = [];
+
+  showProcessing('匯入中，請稍候...');
+  try {
+    rows.slice(1).forEach((r, i) => {
+      const lineNo = i + 2;
+      if (r.every(c => c.trim() === '')) return;
+
+      const rec = {};
+      keyMap.forEach((key, colIdx) => { if (key) rec[key] = (r[colIdx] ?? '').trim(); });
+
+      const type = normalizeCsvType(rec.type);
+      if (!type)      { errors.push(`第 ${lineNo} 列：無法辨識的類型「${rec.type || ''}」`); return; }
+      if (!rec.title) { errors.push(`第 ${lineNo} 列：缺少標題/名稱`); return; }
+
+      try {
+        switch (type) {
+          case 'event':
+            DB.saveEvent({
+              id: genId(), tripId: S.tripId, title: rec.title,
+              date: normalizeCsvDate(rec.date),
+              startTime: normalizeCsvTime(rec.startTime),
+              endTime: normalizeCsvTime(rec.endTime),
+              category: normalizeCsvCategory(rec.category) || 'other',
+              location: rec.location || '', notes: rec.notes || '', photos: [],
+            });
+            break;
+          case 'shopping':
+            DB.saveShop({
+              id: genId(), tripId: S.tripId, name: rec.title,
+              qty: rec.qty || '', price: rec.price || '', category: rec.category || '',
+              date: normalizeCsvDate(rec.date), eventId: null,
+              notes: rec.notes || '', photos: [], purchased: false,
+            });
+            break;
+          case 'todo':
+            DB.saveTodo({
+              id: genId(), tripId: S.tripId, title: rec.title,
+              dueDate: normalizeCsvDate(rec.dueDate),
+              priority: normalizeCsvPriority(rec.priority) || 'medium',
+              assignedDate: normalizeCsvDate(rec.date), eventId: null,
+              notes: rec.notes || '', photos: [], completed: false,
+            });
+            break;
+          case 'location':
+            DB.saveLoc({
+              id: genId(), tripId: S.tripId, name: rec.title,
+              address: rec.location || '',
+              category: normalizeCsvCategory(rec.category) || 'other',
+              notes: rec.notes || '',
+            });
+            break;
+        }
+        ok++;
+      } catch (err) {
+        errors.push(`第 ${lineNo} 列：儲存失敗（${err?.message || err}）`);
+      }
     });
-  });
 
-  (data.locations || []).forEach(loc => {
-    DB.saveLoc({ ...loc, id: genId(), tripId: newTripId });
-  });
+    await renderDetail();
+  } finally {
+    hideProcessing();
+  }
 
-  render();
-  openTrip(newTripId);
+  let msg = `匯入完成：成功 ${ok} 筆`;
+  if (errors.length) {
+    msg += `，略過 ${errors.length} 筆\n\n` + errors.slice(0, 10).join('\n');
+    if (errors.length > 10) msg += `\n...其餘 ${errors.length - 10} 筆省略`;
+  }
+  alert(msg);
 }
 
 // ─── Modal: Open ─────────────────────────────────────────────────────────────
@@ -818,17 +1363,18 @@ function fillTripForm(t) {
 
 // ─── Photos ────────────────────────────────────────────────────────────────
 
-function initPhotos(kind, photos) {
+async function initPhotos(kind, photos) {
   S.editPhotos = photos ? [...photos] : [];
-  renderPhotoStrip(kind);
+  await renderPhotoStrip(kind);
 }
 
-function renderPhotoStrip(kind) {
+async function renderPhotoStrip(kind) {
   const strip = $(`${kind}-photo-strip`);
   if (!strip) return;
-  strip.innerHTML = S.editPhotos.map((src, i) => `
+  const urls = await Promise.all(S.editPhotos.map(getPhotoUrl));
+  strip.innerHTML = S.editPhotos.map((_id, i) => `
     <div class="photo-thumb">
-      <img src="${src}" data-action="view-photo" data-src="${esc(src)}">
+      <img src="${urls[i]}" data-action="view-photo" data-src="${esc(urls[i])}">
       <button type="button" class="photo-remove" data-action="remove-photo" data-index="${i}">✕</button>
     </div>`).join('') +
     (S.editPhotos.length < MAX_PHOTOS_PER_ITEM
@@ -836,7 +1382,7 @@ function renderPhotoStrip(kind) {
       : '');
 }
 
-function readAndCompressImage(file, maxDim = 1000, quality = 0.68) {
+function readAndCompressImage(file, maxDim = 1600, quality = 0.8) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(reader.error);
@@ -853,7 +1399,9 @@ function readAndCompressImage(file, maxDim = 1000, quality = 0.68) {
         const canvas = document.createElement('canvas');
         canvas.width = width; canvas.height = height;
         canvas.getContext('2d').drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', quality));
+        canvas.toBlob(blob => {
+          if (blob) resolve(blob); else reject(new Error('圖片壓縮失敗'));
+        }, 'image/jpeg', quality);
       };
       img.src = reader.result;
     };
@@ -868,12 +1416,15 @@ async function handlePhotoFiles(kind, files) {
   const toProcess = files.filter(f => f.type.startsWith('image/')).slice(0, room);
   for (const file of toProcess) {
     try {
-      S.editPhotos.push(await readAndCompressImage(file));
+      const blob = await readAndCompressImage(file);
+      const id = genId();
+      await savePhotoBlob(id, blob);
+      S.editPhotos.push(id);
     } catch {
       alert(`「${file.name}」讀取失敗，已略過`);
     }
   }
-  renderPhotoStrip(kind);
+  await renderPhotoStrip(kind);
 }
 
 function fillEventForm(ev) {
@@ -1022,6 +1573,53 @@ function fillMoveEventForm(ev) {
   $('move-event-date').innerHTML = buildDayOptions(S.tripId, ev?.date || '');
 }
 
+// ─── Copy to another trip ────────────────────────────────────────────────────
+
+function buildTripOptions(excludeTripId) {
+  const trips = DB.trips().filter(t => t.id !== excludeTripId);
+  if (!trips.length) return '<option value="">沒有其他行程可選</option>';
+  return trips.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('');
+}
+
+function openCopyModal(itemType, itemId) {
+  const trips = DB.trips().filter(t => t.id !== S.tripId);
+  if (!trips.length) { alert('目前沒有其他行程可以複製過去，請先建立另一個行程'); return; }
+
+  S.copyType   = itemType;
+  S.copyItemId = itemId;
+  $('copy-target-trip').innerHTML = buildTripOptions(S.tripId);
+
+  $('modal-overlay').style.display = '';
+  document.querySelectorAll('.modal').forEach(m => m.style.display = 'none');
+  $('modal-copy').style.display = '';
+  S.modal = 'copy';
+}
+
+async function saveCopyForm() {
+  const targetId = $('copy-target-trip').value;
+  if (!targetId) { closeModal(); return; }
+
+  let item;
+  if      (S.copyType === 'event')    item = DB.event(S.copyItemId);
+  else if (S.copyType === 'shopping') item = DB.shopItem(S.copyItemId);
+  else if (S.copyType === 'todo')     item = DB.todo(S.copyItemId);
+  if (!item) { closeModal(); return; }
+
+  // Duplicate the underlying photo blobs (not just the ids) so the copy is
+  // truly independent — otherwise deleting a photo on one side, or deleting
+  // the original item, would silently break the other side's photos too.
+  const newPhotoIds = await duplicatePhotoBlobs(item.photos);
+
+  const copy = { ...item, id: genId(), tripId: targetId, eventId: null, photos: newPhotoIds };
+  if      (S.copyType === 'event')    DB.saveEvent(copy);
+  else if (S.copyType === 'shopping') DB.saveShop(copy);
+  else if (S.copyType === 'todo')     DB.saveTodo(copy);
+
+  const targetName = DB.trip(targetId)?.name || '';
+  closeModal();
+  alert(`已複製到「${targetName}」`);
+}
+
 function fillLocationForm(loc) {
   $('modal-location-title').textContent = loc ? '編輯地點' : '新增地點';
   $('location-name').value     = loc?.name     || '';
@@ -1037,6 +1635,7 @@ function closeModal() {
   document.querySelectorAll('.modal').forEach(m => m.style.display = 'none');
   S.modal = null; S.editId = null; S.confirmCb = null;
   S.pendingDate = null; S.pendingEventId = null; S.editPhotos = [];
+  S.copyType = null; S.copyItemId = null;
 }
 
 
@@ -1050,6 +1649,7 @@ function saveModal() {
     case 'todo':     saveTodoForm();     break;
     case 'location': saveLocationForm(); break;
     case 'move-event': saveMoveEventForm(); break;
+    case 'copy': saveCopyForm(); break;
   }
 }
 
@@ -1085,6 +1685,9 @@ function saveEventForm() {
 
   if (!confirmNoTimeConflict(S.editId, date, startTime, endTime)) return;
 
+  const existing = S.editId ? DB.event(S.editId) : null;
+  const removedPhotoIds = (existing?.photos || []).filter(id => !S.editPhotos.includes(id));
+
   DB.saveEvent({
     id:        S.editId || genId(),
     tripId:    S.tripId,
@@ -1097,6 +1700,7 @@ function saveEventForm() {
     notes:     $('event-notes').value.trim(),
     photos:    [...S.editPhotos],
   });
+  if (removedPhotoIds.length) deletePhotoBlobs(removedPhotoIds).catch(() => {});
   closeModal();
   renderDetail();
 }
@@ -1132,6 +1736,7 @@ function saveShoppingForm() {
   const name = $('shopping-name').value.trim();
   if (!name) { alert('請輸入品項名稱'); return; }
   const existing = S.editId ? DB.shopItem(S.editId) : null;
+  const removedPhotoIds = (existing?.photos || []).filter(id => !S.editPhotos.includes(id));
   DB.saveShop({
     id:        S.editId || genId(),
     tripId:    S.tripId,
@@ -1145,6 +1750,7 @@ function saveShoppingForm() {
     eventId:   S.pendingEventId || existing?.eventId || null,
     photos:    [...S.editPhotos],
   });
+  if (removedPhotoIds.length) deletePhotoBlobs(removedPhotoIds).catch(() => {});
   closeModal();
   renderDetail();
 }
@@ -1153,6 +1759,7 @@ function saveTodoForm() {
   const title = $('todo-title-input').value.trim();
   if (!title) { alert('請輸入事項名稱'); return; }
   const existing = S.editId ? DB.todo(S.editId) : null;
+  const removedPhotoIds = (existing?.photos || []).filter(id => !S.editPhotos.includes(id));
   DB.saveTodo({
     id:        S.editId || genId(),
     tripId:    S.tripId,
@@ -1165,6 +1772,7 @@ function saveTodoForm() {
     eventId:      S.pendingEventId || existing?.eventId || null,
     photos:       [...S.editPhotos],
   });
+  if (removedPhotoIds.length) deletePhotoBlobs(removedPhotoIds).catch(() => {});
   closeModal();
   renderDetail();
 }
@@ -1199,13 +1807,13 @@ function showConfirm(msg, cb) {
 
 function headerAdd() {
   if (S.view === 'trips') { openModal('trip'); return; }
-  const map = { timeline:'event', shopping:'shopping', todo:'todo' };
+  const map = { overview:'event', timeline:'event', shopping:'shopping', todo:'todo' };
   openModal(map[S.tab]);
 }
 
 // ─── Event Delegation ────────────────────────────────────────────────────────
 
-document.addEventListener('click', e => {
+document.addEventListener('click', async e => {
   const el = e.target.closest('[data-action]');
   if (!el) return;
   e.stopPropagation();
@@ -1219,6 +1827,16 @@ document.addEventListener('click', e => {
     // ── Trips ──
     case 'open-trip':
       openTrip(id); break;
+
+    // ── Overview: jump to a day in the Timeline tab ──
+    case 'goto-day': {
+      S.tab = 'timeline';
+      await renderDetail();
+      syncTabBar();
+      document.querySelector(`.day-section[data-date="${CSS.escape(date)}"]`)
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      break;
+    }
 
     case 'delete-trip':
       showConfirm('確定要刪除這個行程？\n（所有相關資料都會一起刪除）', () => {
@@ -1237,6 +1855,9 @@ document.addEventListener('click', e => {
 
     case 'move-event':
       openModal('move-event', DB.event(id)); break;
+
+    case 'copy-event':
+      openCopyModal('event', id); break;
 
     case 'delete-event':
       showConfirm('確定要刪除這個行程項目？', () => {
@@ -1265,6 +1886,9 @@ document.addEventListener('click', e => {
     case 'edit-shopping':
       openModal('shopping', DB.shopItem(id)); break;
 
+    case 'copy-shopping':
+      openCopyModal('shopping', id); break;
+
     case 'delete-shopping':
       showConfirm('確定要刪除這個購物項目？', () => {
         DB.deleteShop(id); renderDetail();
@@ -1278,6 +1902,9 @@ document.addEventListener('click', e => {
     }
     case 'edit-todo':
       openModal('todo', DB.todo(id)); break;
+
+    case 'copy-todo':
+      openCopyModal('todo', id); break;
 
     case 'delete-todo':
       showConfirm('確定要刪除這個代辦事項？', () => {
@@ -1451,6 +2078,14 @@ $('import-file-input').addEventListener('change', e => {
   if (file) importTripFile(file);
 });
 
+$('btn-import-csv').addEventListener('click', () => $('csv-file-input').click());
+
+$('csv-file-input').addEventListener('change', e => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (file) importCsvFile(file);
+});
+
 $('event-has-time').addEventListener('change', e => {
   $('event-time-fields').style.display = e.target.checked ? '' : 'none';
   updateComputedEndTime();
@@ -1482,9 +2117,14 @@ $('modal-overlay').addEventListener('click', e => {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+  try {
+    await migratePhotosToIndexedDB();
+  } catch (err) {
+    console.error('photo migration failed', err);
   }
   render();
 });
