@@ -98,6 +98,136 @@ function esc(str) {
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// ─── Photo Storage (IndexedDB) ────────────────────────────────────────────────
+// Photos are stored as Blobs in IndexedDB, keyed by a small id. Every item's
+// `photos` array only holds these ids (not the image data itself) — this is
+// what lets photos live outside localStorage's ~5-10MB quota.
+
+const PHOTO_DB_NAME    = 'trip-planner-photos';
+const PHOTO_DB_VERSION = 1;
+const PHOTO_STORE      = 'photos';
+
+let _photoDbPromise = null;
+function openPhotoDb() {
+  if (_photoDbPromise) return _photoDbPromise;
+  _photoDbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(PHOTO_DB_NAME, PHOTO_DB_VERSION);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(PHOTO_STORE)) {
+        req.result.createObjectStore(PHOTO_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+  return _photoDbPromise;
+}
+
+async function savePhotoBlob(id, blob) {
+  const db = await openPhotoDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE, 'readwrite');
+    tx.objectStore(PHOTO_STORE).put(blob, id);
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+async function loadPhotoBlob(id) {
+  const db = await openPhotoDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(PHOTO_STORE, 'readonly').objectStore(PHOTO_STORE).get(id);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function deletePhotoBlobs(ids) {
+  if (!ids || !ids.length) return;
+  ids.forEach(revokePhotoUrl);
+  const db = await openPhotoDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE, 'readwrite');
+    const store = tx.objectStore(PHOTO_STORE);
+    ids.forEach(id => store.delete(id));
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+async function duplicatePhotoBlobs(ids) {
+  const newIds = [];
+  for (const id of (ids || [])) {
+    const blob = await loadPhotoBlob(id);
+    if (!blob) continue;
+    const newId = genId();
+    await savePhotoBlob(newId, blob);
+    newIds.push(newId);
+  }
+  return newIds;
+}
+
+// Object URLs are cached (one per photo id, reused across every re-render)
+// instead of being recreated/revoked on every render — far simpler than
+// tracking per-render lifecycles, and they're only released when the photo
+// itself is actually deleted.
+const photoUrlCache = new Map();
+
+async function getPhotoUrl(id) {
+  if (photoUrlCache.has(id)) return photoUrlCache.get(id);
+  const blob = await loadPhotoBlob(id);
+  if (!blob) return '';
+  const url = URL.createObjectURL(blob);
+  photoUrlCache.set(id, url);
+  return url;
+}
+
+function revokePhotoUrl(id) {
+  const url = photoUrlCache.get(id);
+  if (url) { URL.revokeObjectURL(url); photoUrlCache.delete(id); }
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload  = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+// One-time migration for data saved before this version: old items store
+// photos as inline Base64 data URLs directly in localStorage. Convert each
+// to a Blob in IndexedDB and replace the array entries with ids.
+async function migratePhotosToIndexedDB() {
+  if (localStorage.getItem('photosMigratedV1')) return;
+
+  for (const key of ['events', 'shopping', 'todos']) {
+    const list = DB._read(key);
+    let changed = false;
+    for (const item of list) {
+      if (!item.photos || !item.photos.length) continue;
+      const newIds = [];
+      for (const src of item.photos) {
+        if (typeof src === 'string' && src.startsWith('data:')) {
+          try {
+            const blob = await (await fetch(src)).blob();
+            const id = genId();
+            await savePhotoBlob(id, blob);
+            newIds.push(id);
+            changed = true;
+          } catch { /* skip photo that fails to migrate */ }
+        } else {
+          newIds.push(src);
+        }
+      }
+      item.photos = newIds;
+    }
+    if (changed) DB._write(key, list);
+  }
+  localStorage.setItem('photosMigratedV1', '1');
+}
+
 // ─── Data Layer (localStorage) ───────────────────────────────────────────────
 
 const DB = {
@@ -106,7 +236,7 @@ const DB = {
     try {
       localStorage.setItem(k, JSON.stringify(v));
     } catch (err) {
-      alert('儲存失敗，瀏覽器儲存空間可能已滿（通常是照片太多）。請刪除一些照片或項目後再試一次。');
+      alert('儲存失敗，瀏覽器儲存空間可能已滿。請刪除一些項目後再試一次。');
       throw err;
     }
   },
@@ -121,30 +251,48 @@ const DB = {
     this._write('trips', list);
   },
   deleteTrip(id) {
+    const photoIds = [
+      ...this.events(id).flatMap(e => e.photos || []),
+      ...this.shopping(id).flatMap(s => s.photos || []),
+      ...this.todos(id).flatMap(t => t.photos || []),
+    ];
     this._write('trips',     this.trips().filter(t => t.id !== id));
     this._write('events',    this._read('events').filter(e => e.tripId !== id));
     this._write('shopping',  this._read('shopping').filter(s => s.tripId !== id));
     this._write('todos',     this._read('todos').filter(t => t.tripId !== id));
     this._write('locations', this._read('locations').filter(l => l.tripId !== id));
+    if (photoIds.length) deletePhotoBlobs(photoIds).catch(() => {});
   },
 
   // ── Events ──
   events(tripId)   { return this._read('events').filter(e => e.tripId === tripId); },
   event(id)        { return this._read('events').find(e => e.id === id); },
   saveEvent(ev)    { this._saveItem('events', ev); },
-  deleteEvent(id)  { this._del('events', id); },
+  deleteEvent(id)  {
+    const photos = this.event(id)?.photos;
+    this._del('events', id);
+    if (photos?.length) deletePhotoBlobs(photos).catch(() => {});
+  },
 
   // ── Shopping ──
   shopping(tripId) { return this._read('shopping').filter(s => s.tripId === tripId); },
   shopItem(id)     { return this._read('shopping').find(s => s.id === id); },
   saveShop(item)   { this._saveItem('shopping', item); },
-  deleteShop(id)   { this._del('shopping', id); },
+  deleteShop(id)   {
+    const photos = this.shopItem(id)?.photos;
+    this._del('shopping', id);
+    if (photos?.length) deletePhotoBlobs(photos).catch(() => {});
+  },
 
   // ── Todos ──
   todos(tripId)   { return this._read('todos').filter(t => t.tripId === tripId); },
   todo(id)        { return this._read('todos').find(t => t.id === id); },
   saveTodo(todo)  { this._saveItem('todos', todo); },
-  deleteTodo(id)  { this._del('todos', id); },
+  deleteTodo(id)  {
+    const photos = this.todo(id)?.photos;
+    this._del('todos', id);
+    if (photos?.length) deletePhotoBlobs(photos).catch(() => {});
+  },
 
   // ── Locations ──
   locations(tripId)  { return this._read('locations').filter(l => l.tripId === tripId); },
@@ -180,7 +328,7 @@ const S = {
   copyItemId:     null,
 };
 
-const MAX_PHOTOS_PER_ITEM = 6;
+const MAX_PHOTOS_PER_ITEM = 20;
 
 // ─── DOM Shorthand ───────────────────────────────────────────────────────────
 
@@ -198,7 +346,7 @@ function backToTrips() {
   render();
 }
 
-function setTab(tab) { S.tab = tab; renderDetail(); syncTabBar(); }
+async function setTab(tab) { S.tab = tab; await renderDetail(); syncTabBar(); }
 
 // ─── Top-level Render ────────────────────────────────────────────────────────
 
@@ -210,7 +358,7 @@ const IMPORT_BTN_HTML = `
   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><polyline points="7 10 12 15 17 10"/><path d="M4 19h16"/></svg>
   匯入`;
 
-function render() {
+async function render() {
   const isDetail = S.view === 'detail';
 
   // Header
@@ -226,7 +374,7 @@ function render() {
   $('tab-bar').style.display = isDetail ? '' : 'none';
   $('btn-import-csv').style.display = isDetail ? '' : 'none';
 
-  if (isDetail) { renderDetail(); syncTabBar(); }
+  if (isDetail) { await renderDetail(); syncTabBar(); }
   else          { renderTrips(); }
 }
 
@@ -291,18 +439,18 @@ function tripCard(trip) {
 
 // ─── Detail Screen Dispatch ───────────────────────────────────────────────────
 
-function renderDetail() {
+async function renderDetail() {
   switch (S.tab) {
-    case 'overview': renderOverview(); break;
-    case 'timeline': renderTimeline(); break;
-    case 'shopping': renderShopping(); break;
-    case 'todo':     renderTodo();     break;
+    case 'overview': await renderOverview(); break;
+    case 'timeline': await renderTimeline(); break;
+    case 'shopping': await renderShopping(); break;
+    case 'todo':     await renderTodo();     break;
   }
 }
 
 // ─── Overview ────────────────────────────────────────────────────────────────
 
-function renderOverview() {
+async function renderOverview() {
   const trip = DB.trip(S.tripId);
   const el   = $('screen-detail');
   if (!trip) { el.innerHTML = ''; return; }
@@ -364,7 +512,7 @@ function renderOverview() {
   const pendingTodos = todos.filter(t => !t.completed).sort(sortTodos).slice(0, 5);
   const todoHtml = pendingTodos.length ? `
     <div class="day-group-header">✅ 待辦事項（未完成）</div>
-    <div class="item-list">${pendingTodos.map(todoItem).join('')}</div>` : '';
+    <div class="item-list">${(await Promise.all(pendingTodos.map(todoItem))).join('')}</div>` : '';
 
   el.innerHTML = `<div class="overview-content">${heroHtml}${statsHtml}${dayHtml}${todoHtml}</div>`;
 }
@@ -401,7 +549,7 @@ const CAT_ICON = {
   accommodation:'🏨', shopping:'🛍', other:'📌',
 };
 
-function renderTimeline() {
+async function renderTimeline() {
   const trip = DB.trip(S.tripId);
   const el   = $('screen-detail');
 
@@ -437,10 +585,10 @@ function renderTimeline() {
   const shopByEvent = groupByEventId(shopping);
   const todoByEvent = groupByEventId(todos);
 
-  const noDateEventsHtml = noDateEvents.map(ev => eventItem(ev, shopByEvent, todoByEvent)).join('');
-  const noDateHtml = standaloneListsHtml(noDateShop, noDateTodo);
+  const noDateEventsHtml = (await Promise.all(noDateEvents.map(ev => eventItem(ev, shopByEvent, todoByEvent)))).join('');
+  const noDateHtml = await standaloneListsHtml(noDateShop, noDateTodo);
 
-  const html = days.map((day, i) => {
+  const html = (await Promise.all(days.map(async (day, i) => {
     const d        = new Date(day + 'T00:00:00');
     const label    = `第 ${i+1} 天 · ${d.getMonth()+1}/${d.getDate()} (週${WD[d.getDay()]})`;
     const dayEvs   = events
@@ -450,7 +598,10 @@ function renderTimeline() {
     // Items added directly in Shopping/Todo tabs for this day (no eventId)
     const dayShop        = shopping.filter(s => !s.eventId && s.date === day);
     const dayTodo        = todos.filter(t => !t.eventId && t.assignedDate === day);
-    const standaloneHtml = standaloneListsHtml(dayShop, dayTodo);
+    const standaloneHtml = await standaloneListsHtml(dayShop, dayTodo);
+    const dayEvsHtml = dayEvs.length
+      ? (await Promise.all(dayEvs.map(ev => eventItem(ev, shopByEvent, todoByEvent)))).join('')
+      : '';
 
     return `
       <div class="day-section" data-date="${esc(day)}">
@@ -459,11 +610,11 @@ function renderTimeline() {
           <button class="btn-add-inline" data-action="add-event" data-date="${esc(day)}">＋ 新增</button>
         </div>
         ${dayEvs.length
-          ? dayEvs.map(ev => eventItem(ev, shopByEvent, todoByEvent)).join('')
+          ? dayEvsHtml
           : (standaloneHtml ? '' : `<div class="day-empty">尚無行程，點「新增」加入</div>`)}
         ${standaloneHtml}
       </div>`;
-  }).join('');
+  }))).join('');
 
   const noDateSection = (noDateEventsHtml || noDateHtml) ? `
     <div class="day-section">
@@ -475,15 +626,17 @@ function renderTimeline() {
   el.innerHTML = `<div class="timeline-content">${noDateSection}${html}</div>`;
 }
 
-function standaloneListsHtml(shopItems, todoItems) {
+async function standaloneListsHtml(shopItems, todoItems) {
   if (!shopItems.length && !todoItems.length) return '';
+  const shopHtml = shopItems.length ? (await Promise.all(shopItems.map(shopItem))).join('') : '';
+  const todoHtml = todoItems.length ? (await Promise.all(todoItems.sort(sortTodos).map(todoItem))).join('') : '';
   return `
     ${shopItems.length ? `
       <div class="event-sub-header">🛒 購物（未排入行程項目）</div>
-      <div class="item-list">${shopItems.map(shopItem).join('')}</div>` : ''}
+      <div class="item-list">${shopHtml}</div>` : ''}
     ${todoItems.length ? `
       <div class="event-sub-header">✅ 代辦（未排入行程項目）</div>
-      <div class="item-list">${todoItems.sort(sortTodos).map(todoItem).join('')}</div>` : ''}
+      <div class="item-list">${todoHtml}</div>` : ''}
   `;
 }
 
@@ -497,17 +650,18 @@ function groupByEventId(items) {
   return map;
 }
 
-function photoThumbsHtml(photos) {
-  if (!photos || !photos.length) return '';
-  const shown = photos.slice(0, 4);
+async function photoThumbsHtml(photoIds) {
+  if (!photoIds || !photoIds.length) return '';
+  const shown = photoIds.slice(0, 4);
+  const urls  = await Promise.all(shown.map(getPhotoUrl));
   return `
     <div class="item-photos">
-      ${shown.map(src => `<img src="${src}" class="item-photo-thumb" data-action="view-photo" data-src="${esc(src)}">`).join('')}
-      ${photos.length > shown.length ? `<span class="item-photo-more">+${photos.length - shown.length}</span>` : ''}
+      ${urls.map(url => `<img src="${url}" class="item-photo-thumb" data-action="view-photo" data-src="${esc(url)}">`).join('')}
+      ${photoIds.length > shown.length ? `<span class="item-photo-more">+${photoIds.length - shown.length}</span>` : ''}
     </div>`;
 }
 
-function eventItem(ev, shopByEvent, todoByEvent) {
+async function eventItem(ev, shopByEvent, todoByEvent) {
   const icon    = CAT_ICON[ev.category] || '📌';
   const timeStr = ev.startTime
     ? (ev.endTime ? `${ev.startTime}–${ev.endTime}` : ev.startTime)
@@ -515,6 +669,7 @@ function eventItem(ev, shopByEvent, todoByEvent) {
 
   const shopItems = shopByEvent.get(ev.id) || [];
   const todoItems = todoByEvent.get(ev.id) || [];
+  const photosHtml = await photoThumbsHtml(ev.photos);
 
   const shopHtml = shopItems.length ? `
     <div class="inline-list-header">🛒 購物 (${shopItems.length})</div>
@@ -547,7 +702,7 @@ function eventItem(ev, shopByEvent, todoByEvent) {
         ${timeStr     ? `<div class="event-meta">⏰ ${esc(timeStr)}</div>`    : ''}
         ${ev.location ? `<div class="event-meta">📍 ${esc(ev.location)}</div>`: ''}
         ${ev.notes    ? `<div class="event-notes">${esc(ev.notes)}</div>`     : ''}
-        ${photoThumbsHtml(ev.photos)}
+        ${photosHtml}
       </div>
       <button class="btn-del" data-action="delete-event" data-id="${esc(ev.id)}">✕</button>
     </div>
@@ -564,7 +719,7 @@ function eventItem(ev, shopByEvent, todoByEvent) {
 
 // ─── Shopping ────────────────────────────────────────────────────────────────
 
-function renderShopping() {
+async function renderShopping() {
   const items     = DB.shopping(S.tripId);
   const trip      = DB.trip(S.tripId);
   const days      = getDays(trip?.startDate, trip?.endDate);
@@ -600,44 +755,49 @@ function renderShopping() {
     else noDate.push(item);
   });
 
-  days.forEach((day, i) => {
+  for (let i = 0; i < days.length; i++) {
+    const day = days[i];
     const dayItems = byDate[day];
-    if (!dayItems?.length) return;
+    if (!dayItems?.length) continue;
     const d = new Date(day + 'T00:00:00');
     html += `<div class="day-group-header">第${i+1}天 · ${d.getMonth()+1}/${d.getDate()} (週${WD[d.getDay()]})</div>`;
 
     const dayEvs = allEvs.filter(e => e.date === day)
       .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
     const shown = new Set();
-    dayEvs.forEach(ev => {
+    for (const ev of dayEvs) {
       const evItems = dayItems.filter(item => item.eventId === ev.id);
-      if (!evItems.length) return;
+      if (!evItems.length) continue;
       const t = ev.startTime ? `${ev.startTime} ` : '';
+      const evItemsHtml = (await Promise.all(evItems.map(shopItem))).join('');
       html += `<div class="event-sub-header">${esc(t + ev.title)}</div>
-               <div class="item-list">${evItems.map(shopItem).join('')}</div>`;
+               <div class="item-list">${evItemsHtml}</div>`;
       evItems.forEach(item => shown.add(item.id));
-    });
+    }
     const orphans = dayItems.filter(item => !shown.has(item.id));
     if (orphans.length) {
+      const orphansHtml = (await Promise.all(orphans.map(shopItem))).join('');
       html += `<div class="event-sub-header">其他</div>
-               <div class="item-list">${orphans.map(shopItem).join('')}</div>`;
+               <div class="item-list">${orphansHtml}</div>`;
     }
-  });
+  }
 
   if (noDate.length) {
+    const noDateHtml = (await Promise.all(noDate.map(shopItem))).join('');
     html += `<div class="day-group-header">整個行程</div>
-             <div class="item-list">${noDate.map(shopItem).join('')}</div>`;
+             <div class="item-list">${noDateHtml}</div>`;
   }
 
   $('screen-detail').innerHTML = html;
 }
 
-function shopItem(item) {
+async function shopItem(item) {
   const meta = [
     item.qty      ? `數量：${esc(item.qty)}`   : '',
     item.price    ? `¥${esc(item.price)}`      : '',
     item.category ? esc(item.category)         : '',
   ].filter(Boolean).join(' · ');
+  const photosHtml = await photoThumbsHtml(item.photos);
 
   return `
     <div class="list-item${item.purchased ? ' item-done' : ''}" data-action="edit-shopping" data-id="${esc(item.id)}">
@@ -649,7 +809,7 @@ function shopItem(item) {
         <div class="item-title">${esc(item.name)}</div>
         ${meta  ? `<div class="item-meta">${meta}</div>`               : ''}
         ${item.notes ? `<div class="item-notes">${esc(item.notes)}</div>` : ''}
-        ${photoThumbsHtml(item.photos)}
+        ${photosHtml}
       </div>
       <button class="btn-copy" data-action="copy-shopping" data-id="${esc(item.id)}" title="複製到其他行程">📋</button>
       <button class="btn-del" data-action="delete-shopping" data-id="${esc(item.id)}">✕</button>
@@ -670,7 +830,7 @@ function sortTodos(a, b) {
   return (PRIO_ORDER[a.priority] ?? 1) - (PRIO_ORDER[b.priority] ?? 1);
 }
 
-function renderTodo() {
+async function renderTodo() {
   const todos     = DB.todos(S.tripId);
   const trip      = DB.trip(S.tripId);
   const days      = getDays(trip?.startDate, trip?.endDate);
@@ -704,44 +864,49 @@ function renderTodo() {
     else noDate.push(t);
   });
 
-  days.forEach((day, i) => {
+  for (let i = 0; i < days.length; i++) {
+    const day = days[i];
     const dayTodos = byDate[day];
-    if (!dayTodos?.length) return;
+    if (!dayTodos?.length) continue;
     const d = new Date(day + 'T00:00:00');
     html += `<div class="day-group-header">第${i+1}天 · ${d.getMonth()+1}/${d.getDate()} (週${WD[d.getDay()]})</div>`;
 
     const dayEvs = allEvs.filter(e => e.date === day)
       .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
     const shown = new Set();
-    dayEvs.forEach(ev => {
+    for (const ev of dayEvs) {
       const evTodos = dayTodos.filter(t => t.eventId === ev.id);
-      if (!evTodos.length) return;
+      if (!evTodos.length) continue;
       const ti = ev.startTime ? `${ev.startTime} ` : '';
+      const evTodosHtml = (await Promise.all(evTodos.sort(sortTodos).map(todoItem))).join('');
       html += `<div class="event-sub-header">${esc(ti + ev.title)}</div>
-               <div class="item-list">${evTodos.sort(sortTodos).map(todoItem).join('')}</div>`;
+               <div class="item-list">${evTodosHtml}</div>`;
       evTodos.forEach(t => shown.add(t.id));
-    });
+    }
     const orphans = dayTodos.filter(t => !shown.has(t.id)).sort(sortTodos);
     if (orphans.length) {
+      const orphansHtml = (await Promise.all(orphans.map(todoItem))).join('');
       html += `<div class="event-sub-header">其他</div>
-               <div class="item-list">${orphans.map(todoItem).join('')}</div>`;
+               <div class="item-list">${orphansHtml}</div>`;
     }
-  });
+  }
 
   if (noDate.length) {
+    const noDateHtml = (await Promise.all(noDate.sort(sortTodos).map(todoItem))).join('');
     html += `<div class="day-group-header">整個行程</div>
-             <div class="item-list">${noDate.sort(sortTodos).map(todoItem).join('')}</div>`;
+             <div class="item-list">${noDateHtml}</div>`;
   }
 
   $('screen-detail').innerHTML = html;
 }
 
-function todoItem(todo) {
+async function todoItem(todo) {
   const p    = PRIO[todo.priority] || PRIO.medium;
   const meta = [
     `<span class="priority-emoji">${p.emoji}</span>${p.label}`,
     todo.dueDate ? `截止 ${formatDate(todo.dueDate)}` : '',
   ].filter(Boolean).join(' · ');
+  const photosHtml = await photoThumbsHtml(todo.photos);
 
   return `
     <div class="list-item${todo.completed ? ' item-done' : ''}" data-action="edit-todo" data-id="${esc(todo.id)}">
@@ -753,7 +918,7 @@ function todoItem(todo) {
         <div class="item-title">${esc(todo.title)}</div>
         <div class="item-meta">${meta}</div>
         ${todo.notes ? `<div class="item-notes">${esc(todo.notes)}</div>` : ''}
-        ${photoThumbsHtml(todo.photos)}
+        ${photosHtml}
       </div>
       <button class="btn-copy" data-action="copy-todo" data-id="${esc(todo.id)}" title="複製到其他行程">📋</button>
       <button class="btn-del" data-action="delete-todo" data-id="${esc(todo.id)}">✕</button>
@@ -816,17 +981,31 @@ function safeFileName(name) {
   return (name || '行程').replace(/[\\/:*?"<>|]/g, '').trim() || '行程';
 }
 
+async function inlinePhotosForExport(items) {
+  const out = [];
+  for (const item of items) {
+    if (!item.photos || !item.photos.length) { out.push(item); continue; }
+    const dataUrls = [];
+    for (const id of item.photos) {
+      const blob = await loadPhotoBlob(id);
+      if (blob) dataUrls.push(await blobToDataUrl(blob));
+    }
+    out.push({ ...item, photos: dataUrls });
+  }
+  return out;
+}
+
 async function exportTrip(tripId) {
   const trip = DB.trip(tripId);
   if (!trip) return;
 
   const payload = {
     app:       'osaka-trip-planner',
-    version:   1,
+    version:   2,
     trip,
-    events:    DB.events(tripId),
-    shopping:  DB.shopping(tripId),
-    todos:     DB.todos(tripId),
+    events:    await inlinePhotosForExport(DB.events(tripId)),
+    shopping:  await inlinePhotosForExport(DB.shopping(tripId)),
+    todos:     await inlinePhotosForExport(DB.todos(tripId)),
     locations: DB.locations(tripId),
   };
 
@@ -850,6 +1029,21 @@ async function exportTrip(tripId) {
   URL.revokeObjectURL(url);
 }
 
+async function importPhotosFromDataUrls(photos) {
+  if (!photos || !photos.length) return [];
+  const ids = [];
+  for (const src of photos) {
+    if (typeof src !== 'string' || !src.startsWith('data:')) continue;
+    try {
+      const blob = await (await fetch(src)).blob();
+      const id = genId();
+      await savePhotoBlob(id, blob);
+      ids.push(id);
+    } catch { /* skip photo that fails to import */ }
+  }
+  return ids;
+}
+
 async function importTripFile(file) {
   let data;
   try {
@@ -863,29 +1057,34 @@ async function importTripFile(file) {
   DB.saveTrip({ ...data.trip, id: newTripId });
 
   const eventIdMap = new Map();
-  (data.events || []).forEach(ev => {
+  for (const ev of (data.events || [])) {
     const newId = genId();
     eventIdMap.set(ev.id, newId);
-    DB.saveEvent({ ...ev, id: newId, tripId: newTripId });
-  });
+    const photos = await importPhotosFromDataUrls(ev.photos);
+    DB.saveEvent({ ...ev, id: newId, tripId: newTripId, photos });
+  }
 
-  (data.shopping || []).forEach(item => {
+  for (const item of (data.shopping || [])) {
+    const photos = await importPhotosFromDataUrls(item.photos);
     DB.saveShop({
       ...item,
       id: genId(),
       tripId: newTripId,
       eventId: item.eventId ? (eventIdMap.get(item.eventId) || null) : null,
+      photos,
     });
-  });
+  }
 
-  (data.todos || []).forEach(item => {
+  for (const item of (data.todos || [])) {
+    const photos = await importPhotosFromDataUrls(item.photos);
     DB.saveTodo({
       ...item,
       id: genId(),
       tripId: newTripId,
       eventId: item.eventId ? (eventIdMap.get(item.eventId) || null) : null,
+      photos,
     });
-  });
+  }
 
   (data.locations || []).forEach(loc => {
     DB.saveLoc({ ...loc, id: genId(), tripId: newTripId });
@@ -1113,17 +1312,18 @@ function fillTripForm(t) {
 
 // ─── Photos ────────────────────────────────────────────────────────────────
 
-function initPhotos(kind, photos) {
+async function initPhotos(kind, photos) {
   S.editPhotos = photos ? [...photos] : [];
-  renderPhotoStrip(kind);
+  await renderPhotoStrip(kind);
 }
 
-function renderPhotoStrip(kind) {
+async function renderPhotoStrip(kind) {
   const strip = $(`${kind}-photo-strip`);
   if (!strip) return;
-  strip.innerHTML = S.editPhotos.map((src, i) => `
+  const urls = await Promise.all(S.editPhotos.map(getPhotoUrl));
+  strip.innerHTML = S.editPhotos.map((_id, i) => `
     <div class="photo-thumb">
-      <img src="${src}" data-action="view-photo" data-src="${esc(src)}">
+      <img src="${urls[i]}" data-action="view-photo" data-src="${esc(urls[i])}">
       <button type="button" class="photo-remove" data-action="remove-photo" data-index="${i}">✕</button>
     </div>`).join('') +
     (S.editPhotos.length < MAX_PHOTOS_PER_ITEM
@@ -1131,7 +1331,7 @@ function renderPhotoStrip(kind) {
       : '');
 }
 
-function readAndCompressImage(file, maxDim = 1000, quality = 0.68) {
+function readAndCompressImage(file, maxDim = 1600, quality = 0.8) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(reader.error);
@@ -1148,7 +1348,9 @@ function readAndCompressImage(file, maxDim = 1000, quality = 0.68) {
         const canvas = document.createElement('canvas');
         canvas.width = width; canvas.height = height;
         canvas.getContext('2d').drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', quality));
+        canvas.toBlob(blob => {
+          if (blob) resolve(blob); else reject(new Error('圖片壓縮失敗'));
+        }, 'image/jpeg', quality);
       };
       img.src = reader.result;
     };
@@ -1163,12 +1365,15 @@ async function handlePhotoFiles(kind, files) {
   const toProcess = files.filter(f => f.type.startsWith('image/')).slice(0, room);
   for (const file of toProcess) {
     try {
-      S.editPhotos.push(await readAndCompressImage(file));
+      const blob = await readAndCompressImage(file);
+      const id = genId();
+      await savePhotoBlob(id, blob);
+      S.editPhotos.push(id);
     } catch {
       alert(`「${file.name}」讀取失敗，已略過`);
     }
   }
-  renderPhotoStrip(kind);
+  await renderPhotoStrip(kind);
 }
 
 function fillEventForm(ev) {
@@ -1339,7 +1544,7 @@ function openCopyModal(itemType, itemId) {
   S.modal = 'copy';
 }
 
-function saveCopyForm() {
+async function saveCopyForm() {
   const targetId = $('copy-target-trip').value;
   if (!targetId) { closeModal(); return; }
 
@@ -1349,7 +1554,12 @@ function saveCopyForm() {
   else if (S.copyType === 'todo')     item = DB.todo(S.copyItemId);
   if (!item) { closeModal(); return; }
 
-  const copy = { ...item, id: genId(), tripId: targetId, eventId: null };
+  // Duplicate the underlying photo blobs (not just the ids) so the copy is
+  // truly independent — otherwise deleting a photo on one side, or deleting
+  // the original item, would silently break the other side's photos too.
+  const newPhotoIds = await duplicatePhotoBlobs(item.photos);
+
+  const copy = { ...item, id: genId(), tripId: targetId, eventId: null, photos: newPhotoIds };
   if      (S.copyType === 'event')    DB.saveEvent(copy);
   else if (S.copyType === 'shopping') DB.saveShop(copy);
   else if (S.copyType === 'todo')     DB.saveTodo(copy);
@@ -1424,6 +1634,9 @@ function saveEventForm() {
 
   if (!confirmNoTimeConflict(S.editId, date, startTime, endTime)) return;
 
+  const existing = S.editId ? DB.event(S.editId) : null;
+  const removedPhotoIds = (existing?.photos || []).filter(id => !S.editPhotos.includes(id));
+
   DB.saveEvent({
     id:        S.editId || genId(),
     tripId:    S.tripId,
@@ -1436,6 +1649,7 @@ function saveEventForm() {
     notes:     $('event-notes').value.trim(),
     photos:    [...S.editPhotos],
   });
+  if (removedPhotoIds.length) deletePhotoBlobs(removedPhotoIds).catch(() => {});
   closeModal();
   renderDetail();
 }
@@ -1471,6 +1685,7 @@ function saveShoppingForm() {
   const name = $('shopping-name').value.trim();
   if (!name) { alert('請輸入品項名稱'); return; }
   const existing = S.editId ? DB.shopItem(S.editId) : null;
+  const removedPhotoIds = (existing?.photos || []).filter(id => !S.editPhotos.includes(id));
   DB.saveShop({
     id:        S.editId || genId(),
     tripId:    S.tripId,
@@ -1484,6 +1699,7 @@ function saveShoppingForm() {
     eventId:   S.pendingEventId || existing?.eventId || null,
     photos:    [...S.editPhotos],
   });
+  if (removedPhotoIds.length) deletePhotoBlobs(removedPhotoIds).catch(() => {});
   closeModal();
   renderDetail();
 }
@@ -1492,6 +1708,7 @@ function saveTodoForm() {
   const title = $('todo-title-input').value.trim();
   if (!title) { alert('請輸入事項名稱'); return; }
   const existing = S.editId ? DB.todo(S.editId) : null;
+  const removedPhotoIds = (existing?.photos || []).filter(id => !S.editPhotos.includes(id));
   DB.saveTodo({
     id:        S.editId || genId(),
     tripId:    S.tripId,
@@ -1504,6 +1721,7 @@ function saveTodoForm() {
     eventId:      S.pendingEventId || existing?.eventId || null,
     photos:       [...S.editPhotos],
   });
+  if (removedPhotoIds.length) deletePhotoBlobs(removedPhotoIds).catch(() => {});
   closeModal();
   renderDetail();
 }
@@ -1838,9 +2056,14 @@ $('modal-overlay').addEventListener('click', e => {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+  try {
+    await migratePhotosToIndexedDB();
+  } catch (err) {
+    console.error('photo migration failed', err);
   }
   render();
 });
