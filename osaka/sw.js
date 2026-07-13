@@ -1,5 +1,8 @@
-const CACHE = 'trip-planner-v15';
-const ASSETS = ['home.html', 'app.js', 'style.css', 'manifest.json', 'icon.svg'];
+const CACHE = 'trip-planner-v16';
+const ASSETS = [
+  'home.html', 'app.js', 'style.css', 'manifest.json', 'icon.svg',
+  'icon-152.png', 'icon-180.png', 'icon-192.png', 'icon-512.png',
+];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)));
