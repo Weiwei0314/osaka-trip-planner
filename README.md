@@ -18,21 +18,23 @@
 
 純靜態網頁，沒有 npm 套件、沒有建置步驟：
 
-- 直接用瀏覽器開啟 `home.html`，或
-- 用任意靜態伺服器在本機啟動（例如 `npx serve .`），透過 `http://localhost` 開啟——若要測試「安裝到主畫面」或離線快取（Service Worker），需要走 `http://` 或 `https://`，不能是 `file://`。
+- 直接用瀏覽器開啟 `osaka/home.html`，或
+- 用任意靜態伺服器在本機啟動（例如 `npx serve .`），透過 `http://localhost/osaka/` 開啟——若要測試「安裝到主畫面」或離線快取（Service Worker），需要走 `http://` 或 `https://`，不能是 `file://`。
 
 ## 檔案結構
 
+所有網頁檔案都在 `osaka/` 資料夾底下：
+
 | 檔案 | 說明 |
 |---|---|
-| `home.html` | 唯一的頁面，所有畫面（行程列表／時間軸／購物／代辦／總覽）都是同一個頁面裡切換 |
-| `app.js` | 全部邏輯：資料層（`DB`）、渲染、CSV/JSON 匯入匯出、時間輪盤選擇器、拖曳排序 |
-| `style.css` | 樣式 |
-| `sw.js` | Service Worker，離線快取用；改動 `home.html`／`app.js`／`style.css` 後記得同步調高 `CACHE` 版本號，否則已安裝的使用者會讀到舊快取 |
-| `manifest.json` | PWA 設定（圖示、名稱、standalone 模式） |
-| `icon.svg` | App 圖示（原始向量版，瀏覽器分頁圖示用） |
-| `icon-152.png`／`icon-180.png` | iOS「加入主畫面」用的圖示（Apple 只認 PNG，不吃 SVG） |
-| `icon-192.png`／`icon-512.png` | Android／PWA `manifest.json` 用的圖示 |
+| `osaka/home.html` | 唯一的頁面，所有畫面（行程列表／時間軸／購物／代辦／總覽）都是同一個頁面裡切換 |
+| `osaka/app.js` | 全部邏輯：資料層（`DB`）、渲染、CSV/JSON 匯入匯出、時間輪盤選擇器、拖曳排序 |
+| `osaka/style.css` | 樣式 |
+| `osaka/sw.js` | Service Worker，離線快取用；改動 `home.html`／`app.js`／`style.css` 後記得同步調高 `CACHE` 版本號，否則已安裝的使用者會讀到舊快取 |
+| `osaka/manifest.json` | PWA 設定（圖示、名稱、standalone 模式） |
+| `osaka/icon.svg` | 舊版 App 圖示（原始向量版），目前沒有任何地方引用 |
+| `osaka/icon-152.png`／`icon-180.png` | iOS「加入主畫面」用的圖示（Apple 只認 PNG，不吃 SVG） |
+| `osaka/icon-192.png`／`icon-512.png` | Android／PWA `manifest.json` 用的圖示 |
 
 ## 資料儲存與限制
 
