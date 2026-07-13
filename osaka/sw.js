@@ -1,4 +1,4 @@
-const CACHE = 'trip-planner-v19';
+const CACHE = 'trip-planner-v20';
 const ASSETS = [
   'home.html', 'app.js', 'style.css', 'manifest.json',
   'icon-152.png', 'icon-180.png', 'icon-192.png', 'icon-512.png',
