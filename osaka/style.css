@@ -876,6 +876,7 @@ textarea {
   min-height: 80px;
   resize: none;
   line-height: 1.5;
+  overflow: hidden;
 }
 
 .checkbox-label {

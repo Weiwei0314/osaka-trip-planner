@@ -1335,6 +1335,15 @@ async function importCsvFile(file) {
 
 // ─── Modal: Open ─────────────────────────────────────────────────────────────
 
+function autoGrowTextarea(el) {
+  el.style.height = 'auto';
+  el.style.height = el.scrollHeight + 'px';
+}
+
+document.addEventListener('input', e => {
+  if (e.target.tagName === 'TEXTAREA') autoGrowTextarea(e.target);
+});
+
 function openModal(type, data) {
   S.modal  = type;
   S.editId = data?.id || null;
@@ -1350,6 +1359,7 @@ function openModal(type, data) {
     case 'location': fillLocationForm(data); $('modal-location').style.display = ''; break;
     case 'move-event': fillMoveEventForm(data); $('modal-move').style.display  = ''; break;
   }
+  document.querySelectorAll(`#modal-${type} textarea`).forEach(autoGrowTextarea);
 }
 
 function fillTripForm(t) {
