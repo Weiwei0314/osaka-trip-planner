@@ -1,6 +1,6 @@
-const CACHE = 'trip-planner-v16';
+const CACHE = 'trip-planner-v17';
 const ASSETS = [
-  'home.html', 'app.js', 'style.css', 'manifest.json', 'icon.svg',
+  'home.html', 'app.js', 'style.css', 'manifest.json',
   'icon-152.png', 'icon-180.png', 'icon-192.png', 'icon-512.png',
 ];
 
